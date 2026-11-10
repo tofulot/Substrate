@@ -51,7 +51,7 @@ git push origin v0.2.0
 
 A stable tag publishes a normal release; versions such as `0.2.0-rc.1` publish a prerelease. Invalid tags and mismatched versions stop before the Mac build. Tags must point to a commit containing this workflow. Existing published releases are never overwritten. An interrupted draft can be resumed by rerunning the failed workflow.
 
-No repository secrets or provider API keys are required: the publish job uses GitHub's built-in token with `contents: write`; build jobs only have read access. Actions are pinned to commit SHAs. The downloads remain unsigned and unnotarized until Apple signing credentials are configured.
+No repository secrets or provider API keys are required: the publish job uses GitHub's built-in token with `contents: write`; build jobs only have read access. Actions are pinned to commit SHAs. CI bundles an upstream ripgrep binary pinned by checksum and checks that it links only to macOS system libraries. The downloads remain unsigned and unnotarized until Apple signing credentials are configured.
 
 For a build-only check, run **Actions → Release macOS → Run workflow**, or:
 
