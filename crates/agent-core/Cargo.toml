@@ -1,0 +1,21 @@
+[package]
+name = "agent-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+agent-protocol = { path = "../agent-protocol" }
+agent-models = { path = "../agent-models" }
+agent-context = { path = "../agent-context" }
+agent-tools = { path = "../agent-tools" }
+agent-storage = { path = "../agent-storage" }
+agent-runtime = { path = "../agent-runtime" }
+
+[dev-dependencies]
+async-trait.workspace = true

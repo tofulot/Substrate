@@ -1,0 +1,16 @@
+node_modules/
+out/
+dist/
+target/
+release/
+.DS_Store
+*.db
+*.db-shm
+*.db-wal
+.env
+.env.*
+!.env.example
+test-results/
+playwright-report/
+resources/bin/
+__pycache__/
