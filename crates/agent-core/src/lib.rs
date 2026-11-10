@@ -1,5 +1,7 @@
-use agent_models::{ModelProvider, Subquadratic};
-use agent_protocol::{CallTrace, Message, ModelMetrics, RunTrace, Session, ToolActivity};
+use agent_models::{DECISION_MODEL, ModelProvider, Subquadratic};
+use agent_protocol::{
+    CallTrace, ContextSelection, Message, ModelMetrics, RunTrace, Session, ToolActivity,
+};
 use agent_runtime::Runtime;
 use agent_storage::Storage;
 use anyhow::{Result, ensure};
@@ -22,6 +24,22 @@ pub async fn capture_context(
     budget: usize,
     cancel: &CancellationToken,
 ) -> Result<agent_context::ContextPacket> {
+    capture_context_inner(session, storage, budget, cancel, None).await
+}
+struct SelectionRun<'a> {
+    provider: &'a dyn ModelProvider,
+    runtime: &'a Runtime,
+    run_id: &'a str,
+    task: &'a str,
+    cache: &'a mut Option<ContextSelection>,
+}
+async fn capture_context_inner(
+    session: &Session,
+    storage: &Storage,
+    budget: usize,
+    cancel: &CancellationToken,
+    selector: Option<SelectionRun<'_>>,
+) -> Result<agent_context::ContextPacket> {
     let root = agent_tools::workspace(&session.project)?;
     let previous = storage.context(&session.id, None).await?;
     let previous_id = previous.as_ref().map(|m| m.id.clone());
@@ -29,10 +47,112 @@ pub async fn capture_context(
         _=cancel.cancelled()=>anyhow::bail!("Interrupted"),
         result=agent_tools::git(&root,&["rev-parse","HEAD"])=>result.ok().map(|s|s.trim().to_string())
     };
+    let token = cancel.clone();
+    let inventory =
+        tokio::task::spawn_blocking(move || agent_context::inventory(&root, &token)).await??;
+    let mut selection_trace = None;
+    let selection = if let Some(selector) = selector {
+        let task_hash = agent_context::hash(selector.task.as_bytes());
+        let reusable = selector
+            .cache
+            .as_ref()
+            .or_else(|| {
+                previous
+                    .as_ref()
+                    .and_then(|s| s.selection.as_ref())
+                    .filter(|s| s.strategy == "snap" || s.strategy == "snap_with_fallback")
+            })
+            .filter(|s| s.task_hash == task_hash && s.inventory_digest == inventory.digest);
+        let selected = if let Some(selection) = reusable {
+            selection.clone()
+        } else {
+            let local = agent_context::local_selection(&inventory, selector.task);
+            if local.ranks.is_empty() {
+                local
+            } else {
+                let (state, questions) =
+                    agent_context::snap_request(&inventory, selector.task, &local);
+                let mut trace = CallTrace {
+                    id: id(),
+                    run_id: selector.run_id.into(),
+                    session_id: session.id.clone(),
+                    model: DECISION_MODEL.into(),
+                    kind: "context_selection".into(),
+                    started_at: agent_context::now_ms(),
+                    status: "running".into(),
+                    snapshot_id: String::new(),
+                    context_revision: 0,
+                    context_bytes: serde_json::to_vec(&state)?.len() as u64,
+                    history_bytes: 0,
+                    estimated_input_tokens: None,
+                    tool_calls: 0,
+                    metrics: ModelMetrics::default(),
+                };
+                storage.save_call(&trace).await?;
+                selector
+                    .runtime
+                    .emit(
+                        "usage.updated",
+                        json!({"session_id":session.id,"call_id":trace.id}),
+                    )
+                    .await;
+                let response = selector.provider.decide(state, questions, cancel).await;
+                let selected = response
+                    .output
+                    .and_then(|answers| agent_context::snap_selection(&local, &answers));
+                trace.metrics = response.metrics;
+                trace.estimated_input_tokens = trace.metrics.request_bytes.map(|b| b.div_ceil(4));
+                trace.status = if cancel.is_cancelled() {
+                    "interrupted"
+                } else if selected.is_ok() {
+                    "completed"
+                } else {
+                    "failed"
+                }
+                .into();
+                storage.save_call(&trace).await?;
+                selector
+                    .runtime
+                    .emit(
+                        "usage.updated",
+                        json!({"session_id":session.id,"call_id":trace.id}),
+                    )
+                    .await;
+                selection_trace = Some(trace);
+                ensure!(!cancel.is_cancelled(), "Interrupted");
+                selected.unwrap_or_else(|_| {
+                    let mut fallback = local;
+                    fallback.strategy = "fallback".into();
+                    fallback.model = Some(DECISION_MODEL.into());
+                    fallback.reason = Some(
+                        "Snap unavailable or invalid response; using local task relevance".into(),
+                    );
+                    fallback
+                })
+            }
+        };
+        *selector.cache = Some(selected.clone());
+        selected
+    } else {
+        previous
+            .as_ref()
+            .and_then(|s| s.selection.as_ref())
+            .filter(|s| s.inventory_digest == inventory.digest)
+            .cloned()
+            .unwrap_or_else(|| agent_context::local_selection(&inventory, &selection_task(session)))
+    };
     let session_id = session.id.clone();
     let token = cancel.clone();
     let packet = tokio::task::spawn_blocking(move || {
-        agent_context::scan(&root, &session_id, budget, previous.as_ref(), head, &token)
+        agent_context::pack(
+            inventory,
+            &session_id,
+            budget,
+            previous.as_ref(),
+            head,
+            selection,
+            &token,
+        )
     })
     .await??;
     if previous_id.as_deref() != Some(&packet.manifest.id) {
@@ -40,8 +160,48 @@ pub async fn capture_context(
             .save_context(&packet.manifest, &packet.contents)
             .await?;
     }
+    if let Some(mut trace) = selection_trace {
+        trace.snapshot_id = packet.manifest.id.clone();
+        trace.context_revision = packet.manifest.revision;
+        storage.save_call(&trace).await?;
+    }
     Ok(packet)
 }
+fn selection_task(session: &Session) -> String {
+    let latest = session.messages.iter().rposition(|m| m.role == "user");
+    let mut task = latest
+        .map(|i| {
+            format!(
+                "Current task: {}\n",
+                agent_context::bounded(&session.messages[i].content, 8192)
+            )
+        })
+        .unwrap_or_default();
+    for message in session.messages[..latest.unwrap_or(0)]
+        .iter()
+        .rev()
+        .filter(|m| m.role == "user" || m.role == "assistant")
+        .take(2)
+    {
+        task.push_str(&format!(
+            "Prior {}: {}\n",
+            message.role,
+            agent_context::bounded(&message.content, 1536)
+        ));
+    }
+    if task.is_empty() {
+        task = session
+            .input
+            .iter()
+            .rev()
+            .find(|v| v["role"] == "user")
+            .and_then(|v| v["content"].as_str())
+            .unwrap_or_default()
+            .into();
+    }
+    agent_context::bounded(&task, 12 * 1024).into()
+}
+
 fn context_key(path: &str) -> String {
     std::path::Path::new(path)
         .components()
@@ -179,13 +339,28 @@ async fn loop_run(
 ) -> Result<()> {
     let root = agent_tools::workspace(&session.project)?;
     let instructions = agent_context::instructions(&session.project);
+    let task = selection_task(session);
+    let mut selection_cache = None;
     for _ in 0..config.max_steps {
         ensure!(!cancel.is_cancelled(), "Interrupted");
         ensure!(
             agent_context::fits(&session.input),
             "Conversation reached its context budget. Start a new conversation."
         );
-        let packet = capture_context(session, storage, config.context_budget_bytes, cancel).await?;
+        let packet = capture_context_inner(
+            session,
+            storage,
+            config.context_budget_bytes,
+            cancel,
+            Some(SelectionRun {
+                provider,
+                runtime,
+                run_id: &run_trace.id,
+                task: &task,
+                cache: &mut selection_cache,
+            }),
+        )
+        .await?;
         runtime.emit("context.updated",json!({"session_id":session.id,"snapshot_id":packet.manifest.id,"revision":packet.manifest.revision})).await;
         let mut versions = read_versions(&session.input);
         for file in &packet.manifest.files {
@@ -198,6 +373,7 @@ async fn loop_run(
             run_id: run_trace.id.clone(),
             session_id: session.id.clone(),
             model: config.model.clone(),
+            kind: "generation".into(),
             started_at: agent_context::now_ms(),
             status: "running".into(),
             snapshot_id: packet.manifest.id.clone(),

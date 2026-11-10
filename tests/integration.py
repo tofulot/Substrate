@@ -15,6 +15,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = Path(__file__).resolve().parent.parent
 requests = []
+snap_requests = []
+snap_ready = threading.Event()
 stale_ready = threading.Event()
 
 def call(name, args, index=0):
@@ -30,9 +32,30 @@ class Model(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        assert self.headers['Authorization'] == 'Bearer fixture-key'
+        if self.path == '/v1/systemone':
+            snap_requests.append(body)
+            assert body['model'] == 'subq-snap-1.1'
+            assert 1 <= len(body['questions']) <= 128
+            assert len(json.dumps(body).encode()) <= 512*1024
+            assert 'PRIVATE_TEST_SECRET' not in json.dumps(body) and 'ignored-source-data' not in json.dumps(body)
+            assert all(q['type'] == 'score' and len(q['criteria']) == 4 for q in body['questions'].values())
+            task = body['state']['task']
+            if 'snap_unavailable' in task:
+                self.send_response(503); self.end_headers(); self.wfile.write(b'do-not-store-snap-error'); return
+            self.send_response(200); self.send_header('Content-Type', 'application/json'); self.end_headers()
+            if 'snap_cancel' in task:
+                snap_ready.set(); time.sleep(2)
+            answers = {f['id']: {'type': 'score', 'score': (3 if f['path'] == ('a-boilerplate.rs' if 'selection_other' in task else 'z-billing.rs') else 0) if 'selection_' in task or 'snap_' in task else 2, 'confidence': 0.2 if 'snap_uncertain' in task else 0.95} for f in body['state']['files']}
+            if 'snap_invalid' in task:
+                answers = {'../../outside': {'score': 3, 'confidence': 1}}
+            try:
+                self.wfile.write(json.dumps({'answers': answers, 'usage': {'input_tokens': 14, 'output_tokens': 0}}).encode())
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
         requests.append(body)
         assert self.path == '/v1/chat/completions'
-        assert self.headers['Authorization'] == 'Bearer fixture-key'
         assert body['model'] == 'subq-preview' and body['stream'] and body['store'] is False
         assert body['tools'][0]['function']['parameters']['additionalProperties'] is False
         messages = body['messages']
@@ -41,9 +64,14 @@ class Model(BaseHTTPRequestHandler):
         assert messages[1]['role'] == 'user' and messages[1]['content'].startswith('Repository snapshot ')
         assert 'PRIVATE_TEST_SECRET' not in messages[1]['content']
         assert 'ignored-source-data' not in messages[1]['content']
-        if task == 'provider_error':
+        if task.startswith('selection_') or task.startswith('snap_'):
+            paths = [json.loads(line)['path'] for line in messages[1]['content'].splitlines() if line.startswith('{')]
+            wanted, other = ('a-boilerplate.rs', 'z-billing.rs') if task == 'selection_other' else ('z-billing.rs', 'a-boilerplate.rs')
+            assert wanted in paths and other not in paths, paths
+            events = [{"choices": [{"delta": {"content": "Relevant source selected."}, "finish_reason": None}]}]
+        elif task == 'provider_error':
             self.send_response(403); self.end_headers(); self.wfile.write(b'do-not-store-this-provider-body'); return
-        if task == 'stale':
+        elif task == 'stale':
             if outputs:
                 assert 'changed since' in json.loads(outputs[-1]['content'])['error']
                 events = [{"choices": [{"delta": {"content": "Stale edit blocked."}, "finish_reason": None}]}]
@@ -166,6 +194,7 @@ def main():
         assert not any(f['path'] in ['.env', 'ignored.txt'] for f in baseline['files'])
         assert client.rpc('context.file', session_id=session, snapshot_id=baseline['id'], path='hello.txt')['content'] == 'hello'
         assert client.rpc('context.refresh', session_id=session)['id'] == baseline['id']
+        assert not snap_requests, 'Read-only context operations must not call a provider'
         # Concurrent IDs must stay correlated despite out-of-order responses.
         first = client.send('ping'); second = client.send('config.get')
         responses = [client.messages.get(timeout=5), client.messages.get(timeout=5)]
@@ -186,15 +215,20 @@ def main():
         assert saved['messages'][-1]['content'] == 'Done. 世界'
         assert len([m for m in saved['messages'] if m['role'] == 'tool']) == 4
         usage = client.rpc('usage.get', session_id=session)
-        assert len(usage['calls']) == 4 and usage['runs'][0]['status'] == 'completed'
-        assert sum(c['metrics']['usage']['input_tokens'] for c in usage['calls']) == 4010
-        assert all(c['metrics']['usage']['cached_tokens'] == 0 for c in usage['calls'])
-        assert all(c['metrics']['duration_ms'] is not None and c['metrics']['first_output_ms'] is not None for c in usage['calls'])
+        generation = [c for c in usage['calls'] if c['kind'] == 'generation']
+        selection = [c for c in usage['calls'] if c['kind'] == 'context_selection']
+        assert len(generation) == 4 and len(selection) == 2 and usage['runs'][0]['status'] == 'completed'
+        assert len(snap_requests) == 2, 'Reuse selection across reads and unchanged tool turns'
+        assert sum(c['metrics']['usage']['input_tokens'] for c in generation) == 4010
+        assert all(c['metrics']['usage']['cached_tokens'] == 0 for c in generation)
+        assert all(c['metrics']['duration_ms'] is not None and c['metrics']['first_output_ms'] is not None for c in generation)
+        assert all(c['model'] == 'subq-snap-1.1' and c['metrics']['usage']['output_tokens'] == 0 for c in selection)
         assert all(c['metrics']['request_bytes'] > c['context_bytes'] for c in usage['calls'])
         assert all(c['snapshot_id'] and c['run_id'] == usage['runs'][0]['id'] for c in usage['calls'])
         assert 'fixture-key' not in json.dumps(usage)
         current = client.rpc('context.get', session_id=session)['snapshot']
-        assert current['revision'] == 2
+        assert current['revision'] == 3
+        assert current['selection']['strategy'] == 'snap'
         assert client.rpc('context.file', session_id=session, snapshot_id=baseline['id'], path='hello.txt')['content'] == 'hello'
         assert client.rpc('context.file', session_id=session, snapshot_id=current['id'], path='hello.txt')['content'] == 'hello substrate'
         # Rejecting an edit must return a rejection to the model, without a write.
@@ -213,7 +247,7 @@ def main():
         client.wait('agent.completed', lambda p: p.get('session_id') == stale)
         assert (repo / 'hello.txt').read_text() == 'hello substrate\nexternal'
         assert not any(e.get('method') == 'tool.approval.required' and e.get('params', {}).get('session_id') == stale for e in client.events)
-        assert len(client.rpc('context.history', session_id=stale)) == 2
+        assert len(client.rpc('context.history', session_id=stale)) == 3
         # Provider failures and interrupted streams are traced without fabricated token counts.
         failed = client.rpc('session.create', project=str(repo))['id']
         client.rpc('agent.start', session_id=failed, task='provider_error'); client.wait('agent.failed')
@@ -266,6 +300,47 @@ def main():
             assert not any('PRIVATE_TEST_SECRET' in row[1] or 'ignored-source-data' in row[1] for row in blobs)
             input_json = db.execute('SELECT input FROM sessions WHERE id=?', (session,)).fetchone()[0]
             assert 'Repository snapshot ' not in input_json
+        # A tight budget must choose task-relevant source even late in path order.
+        selective = directory / 'selective'; selective.mkdir()
+        (selective / 'a-boilerplate.rs').write_text('unrelated boilerplate\n' * 1100)
+        (selective / 'z-billing.rs').write_text('invoice settlement implementation\n' * 700)
+        client.rpc('config.update', model='subq-preview', context_budget_bytes=32*1024)
+        for task, strategy in [('selection_semantic', 'snap'), ('snap_unavailable invoice', 'fallback'), ('snap_uncertain invoice', 'fallback'), ('snap_invalid invoice', 'fallback')]:
+            selected = client.rpc('session.create', project=str(selective))['id']
+            initial = client.rpc('context.get', session_id=selected)['snapshot']
+            assert initial['files'][0]['path'] == 'a-boilerplate.rs'
+            before = len(snap_requests)
+            client.rpc('agent.start', session_id=selected, task=task)
+            client.wait('agent.completed', lambda p: p.get('session_id') == selected)
+            result = client.rpc('context.get', session_id=selected)
+            assert not result['stale'] and result['snapshot']['selection']['strategy'] == strategy
+            assert [f['path'] for f in result['snapshot']['files']] == ['z-billing.rs']
+            assert len(snap_requests) == before + 1
+            selected_usage = client.rpc('usage.get', session_id=selected)
+            assert len(selected_usage['calls']) == 2
+            if 'unavailable' in task or 'invalid' in task:
+                assert next(c for c in selected_usage['calls'] if c['kind'] == 'context_selection')['status'] == 'failed'
+            assert 'do-not-store' not in json.dumps(selected_usage)
+            if task == 'selection_semantic':
+                before = len(snap_requests)
+                old_hash = result['snapshot']['selection']['task_hash']
+                client.rpc('agent.start', session_id=selected, task='selection_other')
+                client.wait('agent.completed', lambda p: p.get('session_id') == selected)
+                changed_task = client.rpc('context.get', session_id=selected)['snapshot']
+                assert changed_task['selection']['task_hash'] != old_hash
+                assert [f['path'] for f in changed_task['files']] == ['a-boilerplate.rs']
+                assert len(snap_requests) == before + 1, 'A new task must invalidate selection'
+        interrupted_selection = client.rpc('session.create', project=str(selective))['id']
+        before = len(requests)
+        client.rpc('agent.start', session_id=interrupted_selection, task='snap_cancel')
+        assert snap_ready.wait(timeout=5)
+        started = time.monotonic()
+        client.rpc('agent.interrupt', session_id=interrupted_selection)
+        client.wait('agent.interrupted', lambda p: p.get('session_id') == interrupted_selection)
+        assert time.monotonic() - started < 1.5 and len(requests) == before
+        selection_trace = client.rpc('usage.get', session_id=interrupted_selection)['calls'][0]
+        assert selection_trace['kind'] == 'context_selection' and selection_trace['status'] == 'interrupted'
+        assert selection_trace['metrics']['usage'] is None
         client.close()
         client = Client(directory, url)
         restored = client.rpc('session.resume', session_id=session)

@@ -107,6 +107,8 @@ pub struct CallTrace {
     pub run_id: String,
     pub session_id: String,
     pub model: String,
+    #[serde(default = "generation_kind")]
+    pub kind: String,
     pub started_at: i64,
     pub status: String,
     pub snapshot_id: String,
@@ -117,6 +119,9 @@ pub struct CallTrace {
     pub estimated_input_tokens: Option<u64>,
     pub tool_calls: u64,
     pub metrics: ModelMetrics,
+}
+fn generation_kind() -> String {
+    "generation".into()
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunTrace {
@@ -165,4 +170,26 @@ pub struct ContextSnapshot {
     pub files: Vec<FileVersion>,
     pub excluded: Vec<ExcludedPath>,
     pub changes: Vec<ContextChange>,
+    #[serde(default)]
+    pub selection: Option<ContextSelection>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ContextSelection {
+    pub strategy: String,
+    pub model: Option<String>,
+    pub task_hash: String,
+    pub inventory_digest: String,
+    pub candidate_files: u64,
+    pub snap_files: u64,
+    pub reason: Option<String>,
+    pub ranks: Vec<FileRank>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FileRank {
+    pub path: String,
+    pub hash: String,
+    pub score: f64,
+    pub confidence: Option<f64>,
+    pub source: String,
 }

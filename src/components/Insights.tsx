@@ -116,6 +116,8 @@ export default function Insights({
     }
   }
   const snapshot = state?.snapshot;
+  const selection = snapshot?.selection;
+  const ranks = new Map(selection?.ranks.map((r) => [r.path, r]));
   const calls = usage?.calls || [];
   const reported = (key: keyof TokenUsage) => {
     const known = calls
@@ -209,6 +211,29 @@ export default function Insights({
               SHA-256 {snapshot.digest.slice(0, 16)}…
               {snapshot.git_head && <> · Git {snapshot.git_head.slice(0, 7)}</>}
             </p>
+            {selection && (
+              <div className="run-summary" aria-label="Context selection">
+                <strong>
+                  {selection.strategy === "snap"
+                    ? "Snap-assisted selection"
+                    : selection.strategy === "snap_with_fallback"
+                      ? "Snap + local selection"
+                      : selection.strategy === "fallback"
+                        ? "Local fallback selection"
+                        : "Local task selection"}
+                </strong>
+                <span>
+                  {selection.candidate_files} eligible files ·{" "}
+                  {selection.snap_files} Snap scores used
+                </span>
+                {selection.reason && <span>{selection.reason}</span>}
+                <span>
+                  Snap evaluates up to 128 task-ranked files using bounded
+                  excerpts. Other files use local relevance. Rankings are reused
+                  until the task or files change.
+                </span>
+              </div>
+            )}
             {state.stale && (
               <p className="context-warning">
                 {state.changed_paths.length
@@ -220,8 +245,8 @@ export default function Insights({
             )}
             {snapshot.truncated && (
               <p className="context-warning">
-                The scan reached its entry limit or encountered inaccessible
-                paths. Coverage is incomplete.
+                The scan reached its entry or byte limit or encountered
+                inaccessible paths. Coverage is incomplete.
               </p>
             )}
             <input
@@ -236,7 +261,7 @@ export default function Insights({
                 <button
                   key={file.path}
                   onClick={() => void inspect(file.path)}
-                  title={`Compare snapshot ${file.hash} with the working file`}
+                  title={`Compare snapshot ${file.hash} with the working file. ${ranks.has(file.path) ? `${ranks.get(file.path)!.source} relevance: ${ranks.get(file.path)!.score.toFixed(2)}/3` : ""}`}
                 >
                   <FileCode2 size={12} />
                   <span>{file.path}</span>
@@ -258,8 +283,9 @@ export default function Insights({
                 Git ignore rules, generated folders, symlinks, sensitive paths,
                 private key headers, binary files, and files over 128 KiB are
                 excluded. Ignored descendants are not enumerated. At most 2,000
-                candidate files and 500 exclusion details are recorded; payload
-                selection is deterministic, not a dependency analysis.
+                candidate files, 32 MiB of reads and 500 exclusion details are
+                recorded. Selection ranks full eligible files within the payload
+                budget; small applicable AGENTS.md files are kept first.
               </p>
               {snapshot.excluded.map((entry, i) => (
                 <div key={`${entry.path}-${i}`}>
@@ -285,7 +311,9 @@ export default function Insights({
           {usage && usage.total_calls > calls.length
             ? `Showing the latest ${calls.length}. `
             : ""}
-          Only provider-reported counts are totaled.
+          Only provider-reported counts are totaled.{" "}
+          {calls.filter((c) => c.kind === "context_selection").length} Snap
+          selection call(s) in this window.
         </p>
         <dl className="insights-stats usage-totals">
           <div>
@@ -349,13 +377,25 @@ export default function Insights({
             >
               <span className={`trace-dot trace-${call.status}`} />
               <span>
-                Call {usage!.total_calls - index} · v{call.context_revision}
+                Call {usage!.total_calls - index} ·{" "}
+                {call.kind === "context_selection"
+                  ? "Snap selection"
+                  : `v${call.context_revision}`}
               </span>
               <span>{duration(call.metrics.duration_ms)}</span>
               <ChevronDown size={12} />
             </button>
             {expanded === call.id && (
               <dl className="insights-stats">
+                <div>
+                  <dt>Model / purpose</dt>
+                  <dd>
+                    {call.model} ·{" "}
+                    {call.kind === "context_selection"
+                      ? "Context selection"
+                      : "Generation"}
+                  </dd>
+                </div>
                 <div>
                   <dt>Status</dt>
                   <dd>

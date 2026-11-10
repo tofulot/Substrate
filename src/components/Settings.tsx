@@ -136,7 +136,7 @@ export default function Settings() {
           </select>
           <p className="field-help">
             Preview supports generation and tools. Organization early access is
-            required. Snap is a decision model.
+            required. Snap ranks repository files for each task.
           </p>
           <label htmlFor="context-budget">Repository context budget</label>
           <select
@@ -151,9 +151,9 @@ export default function Settings() {
             ))}
           </select>
           <p className="field-help">
-            Source snapshots stay local until used in a model request. Sensitive
-            and ignored paths are excluded. This byte budget is independent of
-            the 360 KB history cap and is not a token or model capacity limit.
+            Tasks and eligible file excerpts go to Snap for selection; selected
+            source goes to Preview. Sensitive and ignored paths are excluded.
+            This byte budget is separate from the 360 KB history cap.
           </p>
           <div className="permission-note">
             <strong>You're in control</strong>

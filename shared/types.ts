@@ -94,6 +94,23 @@ export interface ContextSnapshot {
   files: FileVersion[];
   excluded: { path: string; reason: string }[];
   changes: ContextChange[];
+  selection?: ContextSelection | null;
+}
+export interface ContextSelection {
+  strategy: "local" | "snap" | "snap_with_fallback" | "fallback";
+  model: string | null;
+  task_hash: string;
+  inventory_digest: string;
+  candidate_files: number;
+  snap_files: number;
+  reason: string | null;
+  ranks: {
+    path: string;
+    hash: string;
+    score: number;
+    confidence: number | null;
+    source: string;
+  }[];
 }
 export interface ContextState {
   snapshot: ContextSnapshot | null;
@@ -113,6 +130,7 @@ export interface CallTrace {
   run_id: string;
   session_id: string;
   model: string;
+  kind?: "generation" | "context_selection";
   started_at: number;
   status: string;
   snapshot_id: string;

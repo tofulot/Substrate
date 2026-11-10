@@ -15,10 +15,20 @@ execFileSync('git', ['-C', repo, '-c', 'user.name=Fixture', '-c', 'user.email=fi
 await writeFile(join(repo, '.env'), 'PRIVATE_TEST_SECRET=hidden')
 await writeFile(join(repo, '.gitignore'), '.env\n')
 let round = 0
+let snapCalls = 0
 const server = createServer(async (req, res) => {
   let body = ''; for await (const chunk of req) body += chunk
   if (req.url === '/v1/models') { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ data: [{ id: 'subq-preview' }, { id: 'subq-snap-1.1' }] })); return }
   const data = JSON.parse(body)
+  if (req.url === '/v1/systemone') {
+    expect(data.model).toBe('subq-snap-1.1')
+    expect(body).not.toContain('PRIVATE_TEST_SECRET')
+    expect(Object.keys(data.questions).length).toBeLessThanOrEqual(128)
+    snapCalls++
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ answers: Object.fromEntries(data.state.files.map(file => [file.id, { type: 'score', score: file.path === 'hello.ts' ? 3 : 1, confidence: 0.95 }])), usage: { input_tokens: 40, output_tokens: 0 } }))
+    return
+  }
   expect(data.model).toBe('subq-preview'); expect(data.store).toBe(false)
   const context = data.messages[1].content
   expect(context).toContain('Repository snapshot ')
@@ -103,17 +113,20 @@ try {
   await expect(page.locator('.code-container .monaco-diff-editor')).toContainText('world')
   await page.screenshot({ animations: 'disabled', path: join(root, 'test-results/workspace.png') })
   await page.getByRole('button', { name: 'Insights', exact: true }).click()
-  await expect(page.getByText('Snapshot v2', { exact: true })).toBeVisible()
-  await expect(page.getByText('5 model call(s).', { exact: false })).toBeVisible()
-  await expect(page.getByText('8,009', { exact: true })).toBeVisible()
-  await expect(page.getByText('4/5 calls', { exact: true }).first()).toBeVisible()
+  await expect(page.getByText('Snapshot v3', { exact: true })).toBeVisible()
+  await expect(page.getByText('7 model call(s).', { exact: false })).toBeVisible()
+  await expect(page.getByText('8,089', { exact: true })).toBeVisible()
+  await expect(page.getByText('6/7 calls', { exact: true }).first()).toBeVisible()
   const report = await page.evaluate(async () => window.substrate.rpc('usage.get', { session_id: localStorage.getItem('substrate.session') }))
-  expect(report.calls.length).toBe(5)
+  expect(report.calls.length).toBe(7)
+  expect(snapCalls).toBe(2)
+  expect(report.calls.filter(call => call.kind === 'context_selection').length).toBe(2)
+  await expect(page.getByText('Snap-assisted selection', { exact: true })).toBeVisible()
   expect(report.calls.filter(call => call.metrics.usage === null).length).toBe(1)
   await writeFile(join(repo, 'hello.ts'), 'export const hello = "substrate" // external\n')
   await expect(page.getByText('Workspace changed', { exact: true })).toBeVisible({ timeout: 15000 })
   await page.getByRole('button', { name: 'Refresh context snapshot' }).click()
-  await expect(page.getByText('Snapshot v3', { exact: true })).toBeVisible()
+  await expect(page.getByText('Snapshot v4', { exact: true })).toBeVisible()
   await expect(page.getByText('Matches workspace', { exact: true })).toBeVisible()
   await page.screenshot({ animations: 'disabled', path: join(root, 'test-results/insights.png') })
   await page.getByLabel('Context snapshot version').selectOption(baseline.id)
@@ -125,8 +138,8 @@ try {
   await expect(page.locator('.message-assistant')).toContainText('Updated hello.ts and verified the command.')
   await page.getByRole('button', { name: 'Toggle file panel' }).click()
   await page.getByRole('button', { name: 'Insights', exact: true }).click()
-  await expect(page.getByText('Snapshot v3', { exact: true })).toBeVisible()
-  await expect(page.getByText('8,009', { exact: true })).toBeVisible()
+  await expect(page.getByText('Snapshot v4', { exact: true })).toBeVisible()
+  await expect(page.getByText('8,089', { exact: true })).toBeVisible()
   // Renderer has no Node primitives, no raw IPC and no credential retrieval.
   expect(await page.evaluate(() => ({ node: typeof window.require, process: typeof window.process, exposed: Object.keys(window.substrate).sort() }))).toEqual({ node: 'undefined', process: 'undefined', exposed: ['onEvent','openProject','platform','rpc','setApiKey'] })
   const secretError = await page.evaluate(async () => { try { await window.substrate.rpc('config.credentials', { key: 'bad' }); return '' } catch (e) { return e.message } })

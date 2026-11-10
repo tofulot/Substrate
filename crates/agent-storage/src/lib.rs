@@ -150,6 +150,9 @@ impl Storage {
                 v.as_object_mut().unwrap().remove("files");
                 v.as_object_mut().unwrap().remove("excluded");
                 v.as_object_mut().unwrap().remove("changes");
+                if let Some(selection) = v["selection"].as_object_mut() {
+                    selection.remove("ranks");
+                }
                 Ok(v)
             })
             .collect()
@@ -309,6 +312,7 @@ mod context_trace_tests {
             }],
             excluded: vec![],
             changes: vec![],
+            selection: None,
         }
     }
     #[tokio::test]
@@ -355,6 +359,7 @@ mod context_trace_tests {
             run_id: "run".into(),
             session_id: "session".into(),
             model: "subq-preview".into(),
+            kind: "generation".into(),
             started_at: 0,
             status: "running".into(),
             snapshot_id: "snapshot".into(),

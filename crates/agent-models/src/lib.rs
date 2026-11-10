@@ -10,11 +10,27 @@ pub struct ModelResponse {
     pub output: Result<Vec<Value>>,
     pub metrics: ModelMetrics,
 }
+pub struct DecisionResponse {
+    pub output: Result<Value>,
+    pub metrics: ModelMetrics,
+}
 
 pub const BASE_URL: &str = "https://api.subq.ai/v1";
 pub const DEFAULT_MODEL: &str = "subq-preview";
+pub const DECISION_MODEL: &str = "subq-snap-1.1";
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
+    async fn decide(
+        &self,
+        _state: Value,
+        _questions: Value,
+        _cancel: &CancellationToken,
+    ) -> DecisionResponse {
+        DecisionResponse {
+            output: Err(anyhow::anyhow!("Context selection unavailable")),
+            metrics: ModelMetrics::default(),
+        }
+    }
     async fn respond(
         &self,
         model: &str,
@@ -172,6 +188,18 @@ fn chat_messages(instructions: &str, input: &[Value]) -> Vec<Value> {
 }
 #[async_trait]
 impl ModelProvider for Subquadratic {
+    async fn decide(
+        &self,
+        state: Value,
+        questions: Value,
+        cancel: &CancellationToken,
+    ) -> DecisionResponse {
+        let start = Instant::now();
+        let mut metrics = ModelMetrics::default();
+        let output = self.decisions(state, questions, cancel, &mut metrics).await;
+        metrics.duration_ms = Some(start.elapsed().as_millis() as u64);
+        DecisionResponse { output, metrics }
+    }
     async fn respond(
         &self,
         model: &str,
@@ -200,6 +228,68 @@ impl ModelProvider for Subquadratic {
     }
 }
 impl Subquadratic {
+    async fn decisions(
+        &self,
+        state: Value,
+        questions: Value,
+        cancel: &CancellationToken,
+        metrics: &mut ModelMetrics,
+    ) -> Result<Value> {
+        ensure!(!cancel.is_cancelled(), "Interrupted");
+        ensure!(!self.key.is_empty(), "Missing Subquadratic API key");
+        ensure!(
+            questions
+                .as_object()
+                .is_some_and(|q| (1..=128).contains(&q.len())),
+            "Invalid Snap question count"
+        );
+        let payload = serde_json::to_vec(
+            &json!({"model":DECISION_MODEL,"state":state,"questions":questions}),
+        )?;
+        ensure!(
+            payload.len() <= 512 * 1024,
+            "Snap selection request exceeds byte limit"
+        );
+        metrics.request_bytes = Some(payload.len() as u64);
+        let request = self
+            .client
+            .post(format!("{}/systemone", self.base_url))
+            .bearer_auth(&self.key)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .timeout(std::time::Duration::from_secs(30))
+            .body(payload)
+            .send();
+        let response = tokio::select! {
+            _=cancel.cancelled()=>bail!("Interrupted"),
+            response=request=>response.map_err(|_| anyhow::anyhow!("Could not reach Snap"))?
+        };
+        metrics.http_status = Some(response.status().as_u16());
+        ensure!(
+            response.status().is_success(),
+            "Snap returned HTTP {}",
+            response.status().as_u16()
+        );
+        let mut stream = response.bytes_stream();
+        let mut bytes = Vec::new();
+        while let Some(chunk) =
+            tokio::select! { _=cancel.cancelled()=>bail!("Interrupted"), c=stream.next()=>c }
+        {
+            let chunk = chunk.map_err(|_| anyhow::anyhow!("Snap response interrupted"))?;
+            metrics.response_bytes = Some(metrics.response_bytes.unwrap_or(0) + chunk.len() as u64);
+            ensure!(
+                bytes.len() + chunk.len() <= 1024 * 1024,
+                "Snap response exceeds byte limit"
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+        let response: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| anyhow::anyhow!("Invalid Snap JSON response"))?;
+        if response["usage"].is_object() {
+            metrics.usage = Some(parse_usage(&response["usage"]));
+        }
+        ensure!(response["answers"].is_object(), "Missing Snap answers");
+        Ok(response["answers"].clone())
+    }
     #[allow(clippy::too_many_arguments)]
     async fn stream(
         &self,
