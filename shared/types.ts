@@ -38,6 +38,7 @@ export interface Config {
   model: string;
   has_key: boolean;
   max_steps: number;
+  context_budget_bytes: number;
 }
 export interface AgentEvent {
   method: string;
@@ -64,4 +65,85 @@ declare global {
   interface Window {
     substrate: DesktopAPI;
   }
+}
+
+export interface FileVersion {
+  path: string;
+  hash: string;
+  bytes: number;
+}
+export interface ContextChange {
+  path: string;
+  kind: "added" | "modified" | "removed";
+  previous_hash: string | null;
+  hash: string | null;
+}
+export interface ContextSnapshot {
+  id: string;
+  session_id: string;
+  revision: number;
+  parent_id: string | null;
+  digest: string;
+  created_at: number;
+  git_head: string | null;
+  budget_bytes: number;
+  source_bytes: number;
+  prompt_bytes: number;
+  scanned_files: number;
+  truncated: boolean;
+  files: FileVersion[];
+  excluded: { path: string; reason: string }[];
+  changes: ContextChange[];
+}
+export interface ContextState {
+  snapshot: ContextSnapshot | null;
+  stale: boolean;
+  changed_paths: string[];
+  checked_at: number;
+}
+export interface TokenUsage {
+  input_tokens: number | null;
+  output_tokens: number | null;
+  total_tokens: number | null;
+  cached_tokens: number | null;
+  reasoning_tokens: number | null;
+}
+export interface CallTrace {
+  id: string;
+  run_id: string;
+  session_id: string;
+  model: string;
+  started_at: number;
+  status: string;
+  snapshot_id: string;
+  context_revision: number;
+  context_bytes: number;
+  history_bytes: number;
+  estimated_input_tokens: number | null;
+  tool_calls: number;
+  metrics: {
+    request_bytes: number | null;
+    response_bytes: number | null;
+    duration_ms: number | null;
+    first_output_ms: number | null;
+    http_status: number | null;
+    finish_reason: string | null;
+    usage: TokenUsage | null;
+  };
+}
+export interface RunTrace {
+  id: string;
+  session_id: string;
+  model: string;
+  started_at: number;
+  ended_at: number | null;
+  status: string;
+  tool_calls: number;
+  tool_ms: number;
+  approval_wait_ms: number;
+}
+export interface UsageReport {
+  calls: CallTrace[];
+  runs: RunTrace[];
+  total_calls: number;
 }

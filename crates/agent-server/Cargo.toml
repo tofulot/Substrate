@@ -16,3 +16,4 @@ agent-tools = { path = "../agent-tools" }
 agent-storage = { path = "../agent-storage" }
 agent-runtime = { path = "../agent-runtime" }
 agent-models = { path = "../agent-models" }
+agent-context = { path = "../agent-context" }

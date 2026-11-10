@@ -12,12 +12,19 @@ await writeFile(join(repo, 'hello.ts'), 'export const hello = "world"\n')
 execFileSync('git', ['init', '-q', repo])
 execFileSync('git', ['-C', repo, 'add', '.'])
 execFileSync('git', ['-C', repo, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'Initial'])
+await writeFile(join(repo, '.env'), 'PRIVATE_TEST_SECRET=hidden')
+await writeFile(join(repo, '.gitignore'), '.env\n')
 let round = 0
 const server = createServer(async (req, res) => {
   let body = ''; for await (const chunk of req) body += chunk
   if (req.url === '/v1/models') { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ data: [{ id: 'subq-preview' }, { id: 'subq-snap-1.1' }] })); return }
   const data = JSON.parse(body)
   expect(data.model).toBe('subq-preview'); expect(data.store).toBe(false)
+  const context = data.messages[1].content
+  expect(context).toContain('Repository snapshot ')
+  expect(context).not.toContain('PRIVATE_TEST_SECRET')
+  const source = context.split('\n').filter(line => line.startsWith('{')).map(line => JSON.parse(line)).find(file => file.path === 'hello.ts')
+  expect(source.content).toContain(round >= 3 ? '"substrate"' : '"world"')
   if (round === 1) expect(data.messages.at(-1).content).toContain('hello.ts')
   const rounds = [
     ['search_repository', { query: 'export const' }],
@@ -37,6 +44,7 @@ const server = createServer(async (req, res) => {
     }
     res.write(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] })}\n\n`)
   }
+  if (round !== 1) res.write(`data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 2000+round, completion_tokens: 30, prompt_tokens_details: { cached_tokens: 0 } } })}\n\n`)
   round++
   res.end('data: [DONE]\n\n')
 })
@@ -56,7 +64,9 @@ try {
   await app.evaluate(({ dialog }, repo) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [repo] }) }, repo)
   await page.getByRole('button', { name: 'Start by opening a workspace' }).click()
   await expect(page.getByText('workspace', { exact: true }).first()).toBeVisible()
+  const baseline = await page.evaluate(async () => (await window.substrate.rpc('context.get', { session_id: localStorage.getItem('substrate.session') })).snapshot)
   await page.getByRole('button', { name: /^Settings/ }).click()
+  await expect(page.getByLabel('Repository context budget')).toHaveValue('524288')
   await page.getByRole('button', { name: 'Test connection' }).click()
   await expect(page.getByText('Connected · subq-preview is available')).toBeVisible()
   await page.getByRole('button', { name: 'Close settings' }).click()
@@ -90,8 +100,31 @@ try {
   await expect(page.locator('.code-container .line-delete').first()).toBeVisible()
   await expect(page.locator('.code-container .monaco-diff-editor')).toContainText('world')
   await page.screenshot({ animations: 'disabled', path: join(root, 'test-results/workspace.png') })
+  await page.getByRole('button', { name: 'Insights', exact: true }).click()
+  await expect(page.getByText('Snapshot v2', { exact: true })).toBeVisible()
+  await expect(page.getByText('5 model call(s).', { exact: false })).toBeVisible()
+  await expect(page.getByText('8,009', { exact: true })).toBeVisible()
+  await expect(page.getByText('4/5 calls', { exact: true }).first()).toBeVisible()
+  const report = await page.evaluate(async () => window.substrate.rpc('usage.get', { session_id: localStorage.getItem('substrate.session') }))
+  expect(report.calls.length).toBe(5)
+  expect(report.calls.filter(call => call.metrics.usage === null).length).toBe(1)
+  await writeFile(join(repo, 'hello.ts'), 'export const hello = "substrate" // external\n')
+  await expect(page.getByText('Workspace changed', { exact: true })).toBeVisible({ timeout: 15000 })
+  await page.getByRole('button', { name: 'Refresh context snapshot' }).click()
+  await expect(page.getByText('Snapshot v3', { exact: true })).toBeVisible()
+  await expect(page.getByText('Matches workspace', { exact: true })).toBeVisible()
+  await page.screenshot({ animations: 'disabled', path: join(root, 'test-results/insights.png') })
+  await page.getByLabel('Context snapshot version').selectOption(baseline.id)
+  await expect(page.getByText('Snapshot v1', { exact: true })).toBeVisible()
+  await page.getByRole('button', { name: 'hello.ts', exact: false }).last().click()
+  await expect(page.locator('.code-container .monaco-diff-editor')).toContainText('world')
+  await expect(page.locator('.code-container .monaco-diff-editor')).toContainText('external')
   await page.reload()
   await expect(page.locator('.message-assistant')).toContainText('Updated hello.ts and verified the command.')
+  await page.getByRole('button', { name: 'Toggle file panel' }).click()
+  await page.getByRole('button', { name: 'Insights', exact: true }).click()
+  await expect(page.getByText('Snapshot v3', { exact: true })).toBeVisible()
+  await expect(page.getByText('8,009', { exact: true })).toBeVisible()
   // Renderer has no Node primitives, no raw IPC and no credential retrieval.
   expect(await page.evaluate(() => ({ node: typeof window.require, process: typeof window.process, exposed: Object.keys(window.substrate).sort() }))).toEqual({ node: 'undefined', process: 'undefined', exposed: ['onEvent','openProject','platform','rpc','setApiKey'] })
   const secretError = await page.evaluate(async () => { try { await window.substrate.rpc('config.credentials', { key: 'bad' }); return '' } catch (e) { return e.message } })

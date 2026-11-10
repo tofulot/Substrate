@@ -1,9 +1,10 @@
 use agent_models::{ModelProvider, Subquadratic};
-use agent_protocol::{Message, Session, ToolActivity};
+use agent_protocol::{CallTrace, Message, ModelMetrics, RunTrace, Session, ToolActivity};
 use agent_runtime::Runtime;
 use agent_storage::Storage;
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
+use std::{collections::HashMap, time::Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 fn id() -> String {
@@ -13,6 +14,70 @@ pub struct RunConfig {
     pub key: String,
     pub model: String,
     pub max_steps: usize,
+    pub context_budget_bytes: usize,
+}
+pub async fn capture_context(
+    session: &Session,
+    storage: &Storage,
+    budget: usize,
+    cancel: &CancellationToken,
+) -> Result<agent_context::ContextPacket> {
+    let root = agent_tools::workspace(&session.project)?;
+    let previous = storage.context(&session.id, None).await?;
+    let previous_id = previous.as_ref().map(|m| m.id.clone());
+    let head = tokio::select! {
+        _=cancel.cancelled()=>anyhow::bail!("Interrupted"),
+        result=agent_tools::git(&root,&["rev-parse","HEAD"])=>result.ok().map(|s|s.trim().to_string())
+    };
+    let session_id = session.id.clone();
+    let token = cancel.clone();
+    let packet = tokio::task::spawn_blocking(move || {
+        agent_context::scan(&root, &session_id, budget, previous.as_ref(), head, &token)
+    })
+    .await??;
+    if previous_id.as_deref() != Some(&packet.manifest.id) {
+        storage
+            .save_context(&packet.manifest, &packet.contents)
+            .await?;
+    }
+    Ok(packet)
+}
+fn context_key(path: &str) -> String {
+    std::path::Path::new(path)
+        .components()
+        .filter_map(|c| {
+            if let std::path::Component::Normal(p) = c {
+                Some(p.to_string_lossy().into_owned())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+fn read_versions(input: &[Value]) -> HashMap<String, String> {
+    let mut calls = HashMap::new();
+    let mut versions = HashMap::new();
+    for item in input {
+        if item["type"] == "function_call" && item["name"] == "read_file" {
+            if let (Some(call), Some(arguments)) =
+                (item["call_id"].as_str(), item["arguments"].as_str())
+                && let Ok(args) = serde_json::from_str::<Value>(arguments)
+                && let Some(path) = args["path"].as_str()
+            {
+                calls.insert(call.to_owned(), context_key(path));
+            }
+        } else if item["type"] == "function_call_output"
+            && let Some(path) = item["call_id"].as_str().and_then(|id| calls.get(id))
+            && let Some(output) = item["output"]
+                .as_str()
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            && let Some(content) = output["content"].as_str()
+        {
+            versions.insert(path.clone(), agent_context::hash(content.as_bytes()));
+        }
+    }
+    versions
 }
 pub async fn run(
     mut session: Session,
@@ -23,6 +88,18 @@ pub async fn run(
     cancel: CancellationToken,
 ) -> Result<()> {
     let provider = Subquadratic::new(config.key.clone())?;
+    let mut run_trace = RunTrace {
+        id: id(),
+        session_id: session.id.clone(),
+        model: config.model.clone(),
+        started_at: agent_context::now_ms(),
+        ended_at: None,
+        status: "running".into(),
+        tool_calls: 0,
+        tool_ms: 0,
+        approval_wait_ms: 0,
+    };
+    storage.save_run(&run_trace).await?;
     if session.messages.is_empty() {
         session.title = task.chars().take(60).collect();
     }
@@ -44,6 +121,7 @@ pub async fn run(
         &runtime,
         &cancel,
         &provider,
+        &mut run_trace,
     )
     .await;
     // Interrupted calls must not leave unresolved tool-call items in the next model request.
@@ -72,6 +150,22 @@ pub async fn run(
         }
     }
     storage.save(&session).await?;
+    run_trace.status = if cancel.is_cancelled() {
+        "interrupted"
+    } else if result.is_ok() {
+        "completed"
+    } else {
+        "failed"
+    }
+    .into();
+    run_trace.ended_at = Some(agent_context::now_ms());
+    storage.save_run(&run_trace).await?;
+    if !cancel.is_cancelled()
+        && let Ok(packet) =
+            capture_context(&session, &storage, config.context_budget_bytes, &cancel).await
+    {
+        runtime.emit("context.updated",json!({"session_id":session.id,"snapshot_id":packet.manifest.id,"revision":packet.manifest.revision})).await;
+    }
     result
 }
 async fn loop_run(
@@ -81,16 +175,46 @@ async fn loop_run(
     runtime: &Runtime,
     cancel: &CancellationToken,
     provider: &dyn ModelProvider,
+    run_trace: &mut RunTrace,
 ) -> Result<()> {
     let root = agent_tools::workspace(&session.project)?;
-    let entries = agent_tools::entries(&root, "").await?;
-    let instructions = agent_context::instructions(&session.project, &entries.to_string());
+    let instructions = agent_context::instructions(&session.project);
     for _ in 0..config.max_steps {
         ensure!(!cancel.is_cancelled(), "Interrupted");
         ensure!(
             agent_context::fits(&session.input),
             "Conversation reached its context budget. Start a new conversation."
         );
+        let packet = capture_context(session, storage, config.context_budget_bytes, cancel).await?;
+        runtime.emit("context.updated",json!({"session_id":session.id,"snapshot_id":packet.manifest.id,"revision":packet.manifest.revision})).await;
+        let mut versions = read_versions(&session.input);
+        for file in &packet.manifest.files {
+            versions.insert(file.path.clone(), file.hash.clone());
+        }
+        let mut model_input = vec![json!({"role":"user","content":packet.prompt()})];
+        model_input.extend(session.input.iter().cloned());
+        let mut trace = CallTrace {
+            id: id(),
+            run_id: run_trace.id.clone(),
+            session_id: session.id.clone(),
+            model: config.model.clone(),
+            started_at: agent_context::now_ms(),
+            status: "running".into(),
+            snapshot_id: packet.manifest.id.clone(),
+            context_revision: packet.manifest.revision,
+            context_bytes: packet.manifest.prompt_bytes,
+            history_bytes: serde_json::to_vec(&session.input)?.len() as u64,
+            estimated_input_tokens: None,
+            tool_calls: 0,
+            metrics: ModelMetrics::default(),
+        };
+        storage.save_call(&trace).await?;
+        runtime
+            .emit(
+                "usage.updated",
+                json!({"session_id":session.id,"call_id":trace.id}),
+            )
+            .await;
         let message_id = id();
         let (tx, mut rx) = mpsc::channel::<String>(128);
         let sid = session.id.clone();
@@ -112,13 +236,36 @@ async fn loop_run(
             .respond(
                 &config.model,
                 &instructions,
-                &session.input,
+                &model_input,
                 agent_tools::definitions(),
                 cancel,
                 tx,
             )
             .await;
         let text = forward.await?;
+        trace.metrics = output.metrics;
+        trace.estimated_input_tokens = trace.metrics.request_bytes.map(|bytes| bytes.div_ceil(4));
+        trace.status = if cancel.is_cancelled() {
+            "interrupted"
+        } else if output.output.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        }
+        .into();
+        trace.tool_calls = output.output.as_ref().map_or(0, |items| {
+            items
+                .iter()
+                .filter(|v| v["type"] == "function_call")
+                .count() as u64
+        });
+        storage.save_call(&trace).await?;
+        runtime
+            .emit(
+                "usage.updated",
+                json!({"session_id":session.id,"call_id":trace.id}),
+            )
+            .await;
         if !text.is_empty() {
             session.messages.push(Message {
                 id: message_id.clone(),
@@ -133,7 +280,7 @@ async fn loop_run(
                 json!({"session_id":session.id,"message_id":message_id}),
             )
             .await;
-        let output = match output {
+        let output = match output.output {
             Ok(o) => o,
             Err(e) => {
                 storage.save(session).await?;
@@ -156,8 +303,24 @@ async fn loop_run(
             let call_id = call["call_id"].as_str().unwrap_or("");
             let args: Result<Value, _> =
                 serde_json::from_str(call["arguments"].as_str().unwrap_or("{}"));
+            run_trace.tool_calls += 1;
             let result = match args {
-                Ok(args) => run_tool(session, name, args, storage, runtime, cancel, &root).await,
+                Ok(args) => {
+                    run_tool(
+                        session,
+                        name,
+                        args,
+                        storage,
+                        runtime,
+                        cancel,
+                        &mut ToolContext {
+                            root: &root,
+                            versions: &versions,
+                            trace: run_trace,
+                        },
+                    )
+                    .await
+                }
                 Err(e) => Err(e.into()),
             };
             let output = match result {
@@ -168,12 +331,18 @@ async fn loop_run(
                 .input
                 .push(json!({"type":"function_call_output","call_id":call_id,"output":output}));
             storage.save(session).await?;
+            storage.save_run(run_trace).await?;
         }
     }
     anyhow::bail!(
         "Stopped after {} model turns. Send a follow-up to continue.",
         config.max_steps
     )
+}
+struct ToolContext<'a> {
+    root: &'a std::path::Path,
+    versions: &'a HashMap<String, String>,
+    trace: &'a mut RunTrace,
 }
 async fn run_tool(
     session: &mut Session,
@@ -182,11 +351,32 @@ async fn run_tool(
     storage: &Storage,
     runtime: &Runtime,
     cancel: &CancellationToken,
-    root: &std::path::Path,
+    context: &mut ToolContext<'_>,
 ) -> Result<Value> {
+    let root = context.root;
     agent_tools::validate(name, &args)?;
     let preview = if name == "apply_patch" {
-        Some(agent_tools::preview(root, &args).await?)
+        let path = agent_tools::string(&args, "path")?;
+        let file = agent_tools::resolve(root, path)?;
+        let expected = context.versions.get(&context_key(path));
+        if file.exists() || expected.is_some() {
+            let expected = expected.ok_or_else(|| {
+                anyhow::anyhow!("Read this file before editing; it is not in the model's snapshot")
+            })?;
+            let current = agent_tools::read(root, path).await?;
+            ensure!(
+                agent_context::hash(current.as_bytes()) == *expected,
+                "File changed since the model read it; refresh context or read it again before editing"
+            );
+        }
+        let preview = agent_tools::preview(root, &args).await?;
+        if let Some(expected) = expected {
+            ensure!(
+                agent_context::hash(preview.before.as_bytes()) == *expected,
+                "File changed while preparing the edit; retry after reading it again"
+            );
+        }
+        Some(preview)
     } else {
         None
     };
@@ -224,7 +414,9 @@ async fn run_tool(
         )
         .await;
     if let Some(rx) = approval {
+        let waiting = Instant::now();
         let approved = tokio::select! {_=cancel.cancelled()=>false,r=rx=>r.unwrap_or(false)};
+        context.trace.approval_wait_ms += waiting.elapsed().as_millis() as u64;
         runtime.clear_approval(&tool.id).await;
         if !approved {
             tool.status = "rejected".into();
@@ -259,6 +451,7 @@ async fn run_tool(
         }
     });
     ensure!(!cancel.is_cancelled(), "Interrupted");
+    let executing = Instant::now();
     let result = if let Some(p) = &tool.preview {
         drop(tx);
         agent_tools::apply(root, p).await
@@ -266,6 +459,7 @@ async fn run_tool(
         agent_tools::execute(root, name, &args, cancel, tx).await
     };
     forward.await?;
+    context.trace.tool_ms += executing.elapsed().as_millis() as u64;
     tool.status = if result
         .as_ref()
         .is_ok_and(|value| name != "execute_command" || value["exit_code"] == 0)
@@ -294,6 +488,19 @@ async fn run_tool(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    fn test_trace(session: &str) -> RunTrace {
+        RunTrace {
+            id: id(),
+            session_id: session.into(),
+            model: "test".into(),
+            started_at: 0,
+            ended_at: None,
+            status: "running".into(),
+            tool_calls: 0,
+            tool_ms: 0,
+            approval_wait_ms: 0,
+        }
+    }
     struct RecoveringModel(AtomicUsize);
     #[async_trait::async_trait]
     impl ModelProvider for RecoveringModel {
@@ -305,7 +512,8 @@ mod tests {
             _tools: Vec<Value>,
             _cancel: &CancellationToken,
             deltas: mpsc::Sender<String>,
-        ) -> Result<Vec<Value>> {
+        ) -> agent_models::ModelResponse {
+            let output=async {
             if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
                 return Ok(vec![
                     json!({"type":"function_call","call_id":"bad","name":"read_file","arguments":"{\"path\":42}"}),
@@ -318,9 +526,12 @@ mod tests {
                     .contains("error")
             );
             deltas.send("Recovered".into()).await?;
-            Ok(vec![
-                json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"Recovered"}]}),
-            ])
+            Ok(vec![json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"Recovered"}]})])
+            }.await;
+            agent_models::ModelResponse {
+                output,
+                metrics: ModelMetrics::default(),
+            }
         }
     }
     async fn fixture() -> (
@@ -345,6 +556,7 @@ mod tests {
             key: String::new(),
             model: "subq-preview".into(),
             max_steps: 3,
+            context_budget_bytes: agent_context::DEFAULT_REPO_BUDGET,
         };
         let model = RecoveringModel(AtomicUsize::new(0));
         loop_run(
@@ -354,6 +566,7 @@ mod tests {
             &runtime,
             &CancellationToken::new(),
             &model,
+            &mut test_trace("test"),
         )
         .await
         .unwrap();
@@ -389,7 +602,11 @@ mod tests {
             &storage,
             &runtime,
             &CancellationToken::new(),
-            &root,
+            &mut ToolContext {
+                root: &root,
+                versions: &HashMap::new(),
+                trace: &mut test_trace("test"),
+            },
         )
         .await
         .unwrap();
@@ -408,11 +625,20 @@ mod tests {
             key: String::new(),
             model: "subq-preview".into(),
             max_steps: 3,
+            context_budget_bytes: agent_context::DEFAULT_REPO_BUDGET,
         };
         assert!(
-            loop_run(&mut session, &config, &storage, &runtime, &token, &model)
-                .await
-                .is_err()
+            loop_run(
+                &mut session,
+                &config,
+                &storage,
+                &runtime,
+                &token,
+                &model,
+                &mut test_trace("test")
+            )
+            .await
+            .is_err()
         );
         assert_eq!(model.0.load(Ordering::SeqCst), 0);
         tokio::fs::remove_dir_all(root).await.unwrap();

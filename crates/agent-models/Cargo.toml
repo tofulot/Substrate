@@ -12,3 +12,4 @@ reqwest.workspace = true
 futures-util.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+agent-protocol = { path = "../agent-protocol" }

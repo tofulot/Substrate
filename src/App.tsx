@@ -1,6 +1,7 @@
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import {
+  Activity,
   ArrowDown,
   ArrowRight,
   ArrowUp,
@@ -34,11 +35,13 @@ import {
   X,
 } from "lucide-react";
 import Markdown from "react-markdown";
+import { version as appVersion } from "../package.json";
 import { api, useStore } from "./lib/store";
 import { Button } from "./components/ui/button";
 import Settings from "./components/Settings";
 import type { Change, FileEntry, Preview, ToolActivity } from "./view-types";
 const CodeView = lazy(() => import("./components/CodeView"));
+const Insights = lazy(() => import("./components/Insights"));
 const Terminal = lazy(() => import("./components/Terminal"));
 function Mark({ small = false }: { small?: boolean }) {
   return (
@@ -214,7 +217,7 @@ export default function App() {
   const [draft, setDraft] = useState("");
   const [sidebar, setSidebar] = useState(true);
   const [panel, setPanel] = useState(false);
-  const [tab, setTab] = useState<"files" | "changes">("files");
+  const [tab, setTab] = useState<"files" | "changes" | "insights">("files");
   const [terminal, setTerminal] = useState(false);
   const [selected, setSelected] = useState<Preview | null>(null);
   const [fileContent, setFileContent] = useState<string | null>(null);
@@ -523,7 +526,7 @@ export default function App() {
           <div className="version-row">
             <span>Substrate</span>
             <span>
-              v0.1.0{" "}
+              v{appVersion}{" "}
               <span className={connected ? "online-dot" : "offline-dot"} />
             </span>
           </div>
@@ -873,6 +876,17 @@ export default function App() {
               <GitCompareArrows size={14} />
               Changes <span>{changes.length}</span>
             </button>
+            <button
+              className={tab === "insights" ? "active" : ""}
+              onClick={() => {
+                setTab("insights");
+                setSelected(null);
+                setFileContent(null);
+              }}
+            >
+              <Activity size={14} />
+              Insights
+            </button>
           </div>
           {session ? (
             <>
@@ -907,6 +921,19 @@ export default function App() {
                     </Suspense>
                   </div>
                 </>
+              ) : tab === "insights" ? (
+                <Suspense
+                  fallback={
+                    <div className="panel-empty">Loading insights…</div>
+                  }
+                >
+                  <Insights
+                    onPreview={(preview) => {
+                      setSelected(preview);
+                      setFileContent(null);
+                    }}
+                  />
+                </Suspense>
               ) : (
                 <div className="file-list">
                   {tab === "files" ? (

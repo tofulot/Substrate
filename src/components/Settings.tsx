@@ -9,16 +9,18 @@ export default function Settings() {
   const config = useStore((s) => s.config);
   const [key, setKey] = useState("");
   const [model, setModel] = useState("subq-preview");
+  const [budget, setBudget] = useState(512 * 1024);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("");
   const [error, setError] = useState("");
   useEffect(() => {
     if (open) {
       setModel(config?.model || "subq-preview");
+      setBudget(config?.context_budget_bytes || 512 * 1024);
       setStatus("");
       setError("");
     } else setKey("");
-  }, [open, config?.model]);
+  }, [open, config?.model, config?.context_budget_bytes]);
   async function save() {
     setBusy(true);
     setError("");
@@ -31,6 +33,7 @@ export default function Settings() {
       await api.rpc("config.update", {
         model,
         max_steps: config?.max_steps ?? 20,
+        context_budget_bytes: budget,
       });
       const next = await api.rpc<Config>("config.get");
       useStore.setState({ config: next });
@@ -134,6 +137,23 @@ export default function Settings() {
           <p className="field-help">
             Preview supports generation and tools. Organization early access is
             required. Snap is a decision model.
+          </p>
+          <label htmlFor="context-budget">Repository context budget</label>
+          <select
+            id="context-budget"
+            value={budget}
+            onChange={(event) => setBudget(Number(event.target.value))}
+          >
+            {[32, 128, 256, 512, 1024, 2048, 4096].map((kib) => (
+              <option key={kib} value={kib * 1024}>
+                {kib >= 1024 ? `${kib / 1024} MiB` : `${kib} KiB`}
+              </option>
+            ))}
+          </select>
+          <p className="field-help">
+            Source snapshots stay local until used in a model request. Sensitive
+            and ignored paths are excluded. This byte budget is independent of
+            the 360 KB history cap and is not a token or model capacity limit.
           </p>
           <div className="permission-note">
             <strong>You're in control</strong>

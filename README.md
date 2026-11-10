@@ -31,6 +31,22 @@ open release/mac-arm64/Substrate.app
 
 `npm run dist:mac` also creates a DMG. These local builds are unsigned and unnotarized. A distribution release needs your own Apple signing identity and notarization setup. The release Rust binary and ripgrep are bundled in the application; Cargo is not needed by users of the built app. Build on the target Mac architecture.
 
+## Repository context and usage
+
+Open the workspace panel and choose **Insights** to inspect repository snapshots and model-call traces. Settings exposes a separate repository context byte budget (512 KiB by default, configurable from 32 KiB to 4 MiB).
+
+The Rust engine captures source when creating a conversation and before each model call. Each snapshot records an immutable manifest with a revision, parent, SHA-256 file hashes, Git HEAD when available, coverage, exclusion reasons, and added/modified/removed context paths. Unchanged content reuses its snapshot; historical file bodies are stored once by hash in SQLite. The renderer receives manifests and fetches individual historical files on demand. Choosing a prior revision lets you compare that version with the working file.
+
+Each model request receives the current snapshot as untrusted repository data, separately from conversation history. New source versions supersede older file reads. Existing files must have been present in the model's snapshot or explicitly read before editing. Whole-file hashes reject proposals based on changed source, including when the requested replacement text still happens to match. The existing approval-time content check also prevents changes while an edit is waiting for approval.
+
+Insights checks freshness every four seconds while open. **Refresh context** captures a new version when the agent is idle; running agents refresh between model turns. Snapshots are per-file observations made during a bounded scan, rather than an atomic freeze of the entire working tree. Removed paths mean removed from context, which can also result from a changed ignore rule or budget.
+
+Context capture respects Git ignore rules, omits generated/dependency directories and symlinks, and filters common sensitive paths, private key headers, binary/non-UTF-8 content, and files over 128 KiB. Scans inspect at most 20,000 returned entries and 2,000 candidate files; at most 500 explicit exclusions are recorded. Ignored descendants are not individually enumerated. Selection is deterministic and budgeted; semantic dependency selection and comprehensive secret detection are not implemented. You can inspect coverage before sending a task. The source payload byte budget is separate from the existing 360 KB conversation-history cap and is not a claim about the model's token capacity.
+
+Usage tracing records task and call IDs, model, context revision, request/response bytes, elapsed time, first output latency, requested tool counts, execution time, approval wait, completion status, and provider-reported token/cache/reasoning counts when returned. The streaming reader consumes trailing usage-only events after the finish signal. Missing fields remain **unknown**; reported zeroes remain zeroes. The request-bytes-divided-by-four estimate is explicitly a heuristic, not a tokenizer count or bill. There are no assumed prices or cache discounts. The Chat Completions integration does not assume undocumented support for requesting usage trailers; availability depends on what the provider returns.
+
+Traces contain metadata rather than prompts, credentials, raw provider errors, or source contents. Source blobs, manifests, conversation data, and traces stay in the local unencrypted database; source is sent to Subquadratic when included in an inference request. Snapshot bodies are not appended to the conversation history. Interrupted traces are recovered as interrupted with unavailable metrics left unknown. Insights totals the latest 200 call records and displays details for the latest 30 calls/tasks/snapshots; historical data is retained in SQLite without automatic pruning.
+
 ## Automatic GitHub releases
 
 The [Release macOS workflow](.github/workflows/release.yml) builds and publishes an Apple Silicon DMG, ZIP, and `SHA256SUMS.txt` when you push a version tag such as `v0.2.0`. Builds run on a native ARM Mac. Source checks, Rust tests, a packaged-app desktop test, and installer integrity checks must pass before publication.
@@ -116,6 +132,6 @@ See [docs/protocol.md](docs/protocol.md) for methods and events. React has no No
 
 ## Current limits
 
-This is the functional foundation and coding vertical slice, not the entire roadmap. The editor is a read-only file/diff viewer; edits go through reviewed agent tools. The terminal displays actual agent command output and is not an interactive PTY. Tree-sitter indexing, semantic context selection, compaction, additional providers, worktree isolation, checkpoints, and concurrent/subagents remain future work. There are no simulated agent actions in the application.
+This is the functional foundation and coding vertical slice, not the entire roadmap. The editor is a read-only file/diff viewer; edits go through reviewed agent tools. The terminal displays actual agent command output and is not an interactive PTY. Tree-sitter indexing, semantic dependency selection, compaction, additional providers, worktree isolation, task rollback checkpoints, and concurrent/subagents remain future work. There are no simulated agent actions in the application.
 
 `SUBSTRATE_DB` overrides the database path for standalone development/tests. `SUBSTRATE_API_BASE` overrides the provider base URL for local contract fixtures; it is a process-level development setting and is never configurable by the renderer. Leaving it unset uses only Subquadratic.

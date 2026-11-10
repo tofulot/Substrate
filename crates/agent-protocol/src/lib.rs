@@ -81,3 +81,88 @@ mod tests {
         assert_eq!(success(r.id, Value::Null)["id"], "a");
     }
 }
+
+/// Values are provider-reported. None means unavailable, never zero or an estimate.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub cached_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ModelMetrics {
+    pub request_bytes: Option<u64>,
+    pub response_bytes: Option<u64>,
+    pub duration_ms: Option<u64>,
+    pub first_output_ms: Option<u64>,
+    pub http_status: Option<u16>,
+    pub finish_reason: Option<String>,
+    pub usage: Option<TokenUsage>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CallTrace {
+    pub id: String,
+    pub run_id: String,
+    pub session_id: String,
+    pub model: String,
+    pub started_at: i64,
+    pub status: String,
+    pub snapshot_id: String,
+    pub context_revision: u64,
+    pub context_bytes: u64,
+    pub history_bytes: u64,
+    /// UTF-8 bytes / 4 heuristic; not a tokenizer count, capacity limit, or bill.
+    pub estimated_input_tokens: Option<u64>,
+    pub tool_calls: u64,
+    pub metrics: ModelMetrics,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RunTrace {
+    pub id: String,
+    pub session_id: String,
+    pub model: String,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub status: String,
+    pub tool_calls: u64,
+    pub tool_ms: u64,
+    pub approval_wait_ms: u64,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FileVersion {
+    pub path: String,
+    pub hash: String,
+    pub bytes: u64,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExcludedPath {
+    pub path: String,
+    pub reason: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ContextChange {
+    pub path: String,
+    pub kind: String,
+    pub previous_hash: Option<String>,
+    pub hash: Option<String>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ContextSnapshot {
+    pub id: String,
+    pub session_id: String,
+    pub revision: u64,
+    pub parent_id: Option<String>,
+    pub digest: String,
+    pub created_at: i64,
+    pub git_head: Option<String>,
+    pub budget_bytes: u64,
+    pub source_bytes: u64,
+    pub prompt_bytes: u64,
+    pub scanned_files: u64,
+    pub truncated: bool,
+    pub files: Vec<FileVersion>,
+    pub excluded: Vec<ExcludedPath>,
+    pub changes: Vec<ContextChange>,
+}

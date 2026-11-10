@@ -43,6 +43,11 @@ const allowed = new Set([
   "git.status",
   "git.branch",
   "git.file",
+  "context.get",
+  "context.refresh",
+  "context.history",
+  "context.file",
+  "usage.get",
 ]);
 function rpc(
   method: string,

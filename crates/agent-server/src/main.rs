@@ -13,6 +13,7 @@ struct Config {
     key: String,
     model: String,
     max_steps: usize,
+    context_budget_bytes: usize,
 }
 #[derive(Clone)]
 struct Server {
@@ -35,7 +36,9 @@ impl Server {
             "ping" => Ok(json!({"version":env!("CARGO_PKG_VERSION"),"provider":"subquadratic"})),
             "config.get" => {
                 let c = self.config.lock().await;
-                Ok(json!({"model":c.model,"has_key":!c.key.is_empty(),"max_steps":c.max_steps}))
+                Ok(
+                    json!({"model":c.model,"has_key":!c.key.is_empty(),"max_steps":c.max_steps,"context_budget_bytes":c.context_budget_bytes}),
+                )
             }
             "config.credentials" => {
                 let key = str_arg(p, "key")?;
@@ -51,11 +54,21 @@ impl Server {
                 );
                 let max_steps = p["max_steps"].as_u64().unwrap_or(20).clamp(1, 50) as usize;
                 let mut c = self.config.lock().await;
+                let budget = p["context_budget_bytes"]
+                    .as_u64()
+                    .unwrap_or(c.context_budget_bytes as u64) as usize;
+                ensure!(
+                    (32 * 1024..=4 * 1024 * 1024).contains(&budget),
+                    "Repository context budget must be 32 KiB–4 MiB"
+                );
+                c.context_budget_bytes = budget;
                 c.model = model.into();
                 c.max_steps = max_steps;
                 tokio::fs::write(
                     &self.config_path,
-                    serde_json::to_vec(&json!({"model":model,"max_steps":max_steps}))?,
+                    serde_json::to_vec(
+                        &json!({"model":model,"max_steps":max_steps,"context_budget_bytes":budget}),
+                    )?,
                 )
                 .await?;
                 Ok(json!(true))
@@ -77,9 +90,82 @@ impl Server {
             }
             "session.create" => {
                 let root = agent_tools::workspace(str_arg(p, "project")?)?;
-                Ok(serde_json::to_value(
-                    self.storage.create(root.to_string_lossy().into()).await?,
-                )?)
+                let session = self.storage.create(root.to_string_lossy().into()).await?;
+                let budget = self.config.lock().await.context_budget_bytes;
+                agent_core::capture_context(
+                    &session,
+                    &self.storage,
+                    budget,
+                    &CancellationToken::new(),
+                )
+                .await?;
+                Ok(serde_json::to_value(session)?)
+            }
+            "context.refresh" => {
+                let jobs = self.runtime.jobs.lock().await;
+                ensure!(
+                    jobs.is_empty(),
+                    "Context refreshes automatically between model turns while an agent runs"
+                );
+                let session = self.storage.get(str_arg(p, "session_id")?).await?;
+                let budget = self.config.lock().await.context_budget_bytes;
+                let packet = agent_core::capture_context(
+                    &session,
+                    &self.storage,
+                    budget,
+                    &CancellationToken::new(),
+                )
+                .await?;
+                drop(jobs);
+                self.runtime.emit("context.updated",json!({"session_id":session.id,"snapshot_id":packet.manifest.id,"revision":packet.manifest.revision})).await;
+                Ok(serde_json::to_value(packet.manifest)?)
+            }
+            "context.get" => {
+                let session = self.storage.get(str_arg(p, "session_id")?).await?;
+                let snapshot = self
+                    .storage
+                    .context(&session.id, p["snapshot_id"].as_str())
+                    .await?;
+                let Some(snapshot) = snapshot else {
+                    return Ok(
+                        json!({"snapshot":null,"stale":false,"changed_paths":[],"checked_at":agent_context::now_ms()}),
+                    );
+                };
+                let root = agent_tools::workspace(&session.project)?;
+                let head = agent_tools::git(&root, &["rev-parse", "HEAD"])
+                    .await
+                    .ok()
+                    .map(|s| s.trim().to_string());
+                let prior = snapshot.clone();
+                let budget = self.config.lock().await.context_budget_bytes;
+                let session_id = session.id.clone();
+                let current = tokio::task::spawn_blocking(move || {
+                    agent_context::scan(
+                        &root,
+                        &session_id,
+                        budget,
+                        Some(&prior),
+                        head,
+                        &CancellationToken::new(),
+                    )
+                })
+                .await??;
+                let stale = current.manifest.digest != snapshot.digest;
+                Ok(
+                    json!({"snapshot":snapshot,"stale":stale,"changed_paths":if stale{current.manifest.changes.iter().map(|c|c.path.clone()).collect::<Vec<_>>()}else{vec![]},"checked_at":agent_context::now_ms()}),
+                )
+            }
+            "context.history" => Ok(json!(
+                self.storage
+                    .context_history(str_arg(p, "session_id")?)
+                    .await?
+            )),
+            "context.file" => Ok(
+                json!({"content":self.storage.context_file(str_arg(p,"session_id")?,str_arg(p,"snapshot_id")?,str_arg(p,"path")?).await?}),
+            ),
+            "usage.get" => {
+                let session = self.storage.get(str_arg(p, "session_id")?).await?;
+                self.storage.usage(&session.id).await
             }
             "session.list" => Ok(serde_json::to_value(self.storage.list().await?)?),
             "session.resume" => {
@@ -117,6 +203,7 @@ impl Server {
                     key: c.key.clone(),
                     model: c.model.clone(),
                     max_steps: c.max_steps,
+                    context_budget_bytes: c.context_budget_bytes,
                 };
                 drop(c);
                 let token = CancellationToken::new();
@@ -239,6 +326,10 @@ async fn main() -> Result<()> {
             key: std::env::var("SUBQ_API_KEY").unwrap_or_default(),
             model: saved["model"].as_str().unwrap_or("subq-preview").into(),
             max_steps: saved["max_steps"].as_u64().unwrap_or(20).clamp(1, 50) as usize,
+            context_budget_bytes: saved["context_budget_bytes"]
+                .as_u64()
+                .unwrap_or(agent_context::DEFAULT_REPO_BUDGET as u64)
+                .clamp(32 * 1024, 4 * 1024 * 1024) as usize,
         })),
     };
     let writer = tokio::spawn(async move {

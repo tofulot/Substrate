@@ -18,6 +18,7 @@ interface State {
   connected: boolean;
   settings: boolean;
   revision: number;
+  insightsRevision: number;
   terminalOutput: string;
   init(): Promise<void>;
   openProject(): Promise<void>;
@@ -38,6 +39,7 @@ export const useStore = create<State>((set, get) => ({
   connected: false,
   settings: false,
   revision: 0,
+  insightsRevision: 0,
   terminalOutput: "",
   setError: (error) =>
     set({ error: error instanceof Error ? error.message : String(error) }),
@@ -170,7 +172,9 @@ export const useStore = create<State>((set, get) => ({
       return;
     }
     if (params.session_id !== get().session?.id) return;
-    if (method === "agent.message.delta") {
+    if (method === "context.updated" || method === "usage.updated") {
+      set((s) => ({ insightsRevision: s.insightsRevision + 1 }));
+    } else if (method === "agent.message.delta") {
       set((state) => {
         const session = state.session!;
         const messages = [...session.messages];

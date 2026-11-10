@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import queue
 import subprocess
+import sqlite3
 import tempfile
 import threading
 import time
@@ -14,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = Path(__file__).resolve().parent.parent
 requests = []
+stale_ready = threading.Event()
 
 def call(name, args, index=0):
     encoded = json.dumps(args)
@@ -36,7 +38,25 @@ class Model(BaseHTTPRequestHandler):
         messages = body['messages']
         task = next(m['content'] for m in reversed(messages) if m['role'] == 'user')
         outputs = [m for m in messages if m['role'] == 'tool']
-        if task == 'cancel':
+        assert messages[1]['role'] == 'user' and messages[1]['content'].startswith('Repository snapshot ')
+        assert 'PRIVATE_TEST_SECRET' not in messages[1]['content']
+        assert 'ignored-source-data' not in messages[1]['content']
+        if task == 'provider_error':
+            self.send_response(403); self.end_headers(); self.wfile.write(b'do-not-store-this-provider-body'); return
+        if task == 'stale':
+            if outputs:
+                assert 'changed since' in json.loads(outputs[-1]['content'])['error']
+                events = [{"choices": [{"delta": {"content": "Stale edit blocked."}, "finish_reason": None}]}]
+            else:
+                events = call('apply_patch', {'path': 'hello.txt', 'old_text': 'hello substrate', 'new_text': 'wrong'})
+        elif task == 'cancel_stream':
+            self.send_response(200); self.send_header('Content-Type', 'text/event-stream'); self.end_headers()
+            self.wfile.write(b'data: {"choices":[{"delta":{"content":"Started"},"finish_reason":null}]}\n\n'); self.wfile.flush()
+            time.sleep(2); return
+
+        elif task == 'length':
+            events = []
+        elif task == 'cancel':
             events = call('execute_command', {'command': 'sleep 60 & child=$!; echo "$child"; wait "$child"'})
         elif task == 'reject':
             if messages[-1]['role'] == 'tool':
@@ -55,11 +75,15 @@ class Model(BaseHTTPRequestHandler):
         else:
             assert json.loads(outputs[-1]['content'])['exit_code'] == 0
             events = [{"choices": [{"delta": {"content": 'Done. 世界'}, "finish_reason": None}]}]
-        events.append({"choices": [{"delta": {}, "finish_reason": 'tool_calls' if any(e['choices'][0]['delta'].get('tool_calls') for e in events) else 'stop'}]})
+        events.append({"choices": [{"delta": {}, "finish_reason": 'length' if task == 'length' else ('tool_calls' if any(e['choices'][0]['delta'].get('tool_calls') for e in events) else 'stop')}]})
+        events.append({"choices": [], "usage": {"prompt_tokens": 1000+len(requests), "completion_tokens": 25, "total_tokens": 1025+len(requests), "prompt_tokens_details": {"cached_tokens": 0}, "completion_tokens_details": {"reasoning_tokens": 5}}})
         self.send_response(200)
         self.send_header('Content-Type', 'text/event-stream')
         self.end_headers()
         try:
+            if task == 'stale' and not outputs:
+                self.wfile.write(b'data: {"choices":[{"delta":{"content":"Preparing edit"},"finish_reason":null}]}\n\n'); self.wfile.flush()
+                assert stale_ready.wait(timeout=5)
             for event in events:
                 frame = ('data: ' + json.dumps(event, ensure_ascii=False) + '\r\n\r\n').encode()
                 # Deliberately split every Unicode codepoint over network writes.
@@ -130,9 +154,18 @@ def main():
         repo = directory / 'repo'
         repo.mkdir()
         (repo / 'hello.txt').write_text('hello')
+        (repo / '.env').write_text('PRIVATE_TEST_SECRET=not-for-model')
+        (repo / '.gitignore').write_text('ignored.txt\n')
+        (repo / 'ignored.txt').write_text('ignored-source-data')
         client = Client(directory, url)
         project = client.rpc('project.open', path=str(repo))
         session = client.rpc('session.create', project=project['path'])['id']
+        baseline = client.rpc('context.get', session_id=session)['snapshot']
+        assert baseline['revision'] == 1
+        assert 'content' not in baseline['files'][0]
+        assert not any(f['path'] in ['.env', 'ignored.txt'] for f in baseline['files'])
+        assert client.rpc('context.file', session_id=session, snapshot_id=baseline['id'], path='hello.txt')['content'] == 'hello'
+        assert client.rpc('context.refresh', session_id=session)['id'] == baseline['id']
         # Concurrent IDs must stay correlated despite out-of-order responses.
         first = client.send('ping'); second = client.send('config.get')
         responses = [client.messages.get(timeout=5), client.messages.get(timeout=5)]
@@ -152,6 +185,18 @@ def main():
         saved = client.rpc('session.resume', session_id=session)
         assert saved['messages'][-1]['content'] == 'Done. 世界'
         assert len([m for m in saved['messages'] if m['role'] == 'tool']) == 4
+        usage = client.rpc('usage.get', session_id=session)
+        assert len(usage['calls']) == 4 and usage['runs'][0]['status'] == 'completed'
+        assert sum(c['metrics']['usage']['input_tokens'] for c in usage['calls']) == 4010
+        assert all(c['metrics']['usage']['cached_tokens'] == 0 for c in usage['calls'])
+        assert all(c['metrics']['duration_ms'] is not None and c['metrics']['first_output_ms'] is not None for c in usage['calls'])
+        assert all(c['metrics']['request_bytes'] > c['context_bytes'] for c in usage['calls'])
+        assert all(c['snapshot_id'] and c['run_id'] == usage['runs'][0]['id'] for c in usage['calls'])
+        assert 'fixture-key' not in json.dumps(usage)
+        current = client.rpc('context.get', session_id=session)['snapshot']
+        assert current['revision'] == 2
+        assert client.rpc('context.file', session_id=session, snapshot_id=baseline['id'], path='hello.txt')['content'] == 'hello'
+        assert client.rpc('context.file', session_id=session, snapshot_id=current['id'], path='hello.txt')['content'] == 'hello substrate'
         # Rejecting an edit must return a rejection to the model, without a write.
         denied = client.rpc('session.create', project=str(repo))['id']
         client.rpc('agent.start', session_id=denied, task='reject')
@@ -159,6 +204,38 @@ def main():
         client.rpc('tool.reject', session_id=denied, tool_id=approval['id'])
         client.wait('agent.completed')
         assert not (repo / 'denied.txt').exists()
+        # An external edit that preserves old_text must still invalidate the model's proposal.
+        stale = client.rpc('session.create', project=str(repo))['id']
+        client.rpc('agent.start', session_id=stale, task='stale')
+        client.wait('agent.message.delta', lambda p: p.get('session_id') == stale)
+        (repo / 'hello.txt').write_text('hello substrate\nexternal')
+        stale_ready.set()
+        client.wait('agent.completed', lambda p: p.get('session_id') == stale)
+        assert (repo / 'hello.txt').read_text() == 'hello substrate\nexternal'
+        assert not any(e.get('method') == 'tool.approval.required' and e.get('params', {}).get('session_id') == stale for e in client.events)
+        assert len(client.rpc('context.history', session_id=stale)) == 2
+        # Provider failures and interrupted streams are traced without fabricated token counts.
+        failed = client.rpc('session.create', project=str(repo))['id']
+        client.rpc('agent.start', session_id=failed, task='provider_error'); client.wait('agent.failed')
+        failure = client.rpc('usage.get', session_id=failed)
+        assert failure['calls'][0]['status'] == 'failed' and failure['calls'][0]['metrics']['http_status'] == 403
+        assert failure['calls'][0]['metrics']['usage'] is None and 'do-not-store' not in json.dumps(failure)
+        limited = client.rpc('session.create', project=str(repo))['id']
+        client.rpc('agent.start', session_id=limited, task='length'); client.wait('agent.failed')
+        limited_trace = client.rpc('usage.get', session_id=limited)['calls'][0]
+        assert limited_trace['status'] == 'failed' and limited_trace['metrics']['finish_reason'] == 'length'
+        assert limited_trace['metrics']['usage']['output_tokens'] == 25
+        interrupted = client.rpc('session.create', project=str(repo))['id']
+        client.rpc('agent.start', session_id=interrupted, task='cancel_stream')
+        client.wait('agent.message.delta', lambda p: p.get('session_id') == interrupted)
+        client.rpc('agent.interrupt', session_id=interrupted); client.wait('agent.interrupted')
+        trace = client.rpc('usage.get', session_id=interrupted)['calls'][0]
+        assert trace['status'] == 'interrupted' and trace['metrics']['usage'] is None
+        assert trace['metrics']['first_output_ms'] is not None
+        # Context inspection reports stale files without changing the captured revision.
+        old = client.rpc('context.get', session_id=session)
+        assert old['stale'] and 'hello.txt' in old['changed_paths']
+        assert old['snapshot']['id'] == current['id']
         # Cancel a running process group, not just the model request.
         cancel = client.rpc('session.create', project=str(repo))['id']
         client.rpc('agent.start', session_id=cancel, task='cancel')
@@ -183,10 +260,18 @@ def main():
             raise AssertionError('Path traversal was accepted')
         except RuntimeError as e:
             assert 'traversal' in str(e)
+        with sqlite3.connect(directory / 'data' / 'test.db') as db:
+            blobs = db.execute('SELECT hash, content FROM context_blobs').fetchall()
+            assert len(blobs) == len({row[0] for row in blobs})
+            assert not any('PRIVATE_TEST_SECRET' in row[1] or 'ignored-source-data' in row[1] for row in blobs)
+            input_json = db.execute('SELECT input FROM sessions WHERE id=?', (session,)).fetchone()[0]
+            assert 'Repository snapshot ' not in input_json
         client.close()
         client = Client(directory, url)
         restored = client.rpc('session.resume', session_id=session)
         assert restored['messages'] == saved['messages']
+        assert client.rpc('usage.get', session_id=session) == usage
+        assert client.rpc('context.file', session_id=session, snapshot_id=baseline['id'], path='hello.txt')['content'] == 'hello'
         assert 'key' not in client.rpc('config.get')
         client.close()
     http.shutdown()
