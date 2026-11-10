@@ -31,6 +31,36 @@ open release/mac-arm64/Substrate.app
 
 `npm run dist:mac` also creates a DMG. These local builds are unsigned and unnotarized. A distribution release needs your own Apple signing identity and notarization setup. The release Rust binary and ripgrep are bundled in the application; Cargo is not needed by users of the built app. Build on the target Mac architecture.
 
+## Automatic GitHub releases
+
+The [Release macOS workflow](.github/workflows/release.yml) builds and publishes an Apple Silicon DMG, ZIP, and `SHA256SUMS.txt` when you push a version tag such as `v0.2.0`. Builds run on a native ARM Mac. Source checks, Rust tests, a packaged-app desktop test, and installer integrity checks must pass before publication.
+
+Before tagging, set the same version in `package.json`, `package-lock.json`, and `Cargo.toml` under `[workspace.package]`. For example:
+
+```sh
+npm version 0.2.0 --no-git-tag-version
+# Set workspace.package.version = "0.2.0" in Cargo.toml.
+cargo check --workspace          # Updates local crate versions in Cargo.lock.
+node scripts/release-info.mjs    # Checks that all release versions agree.
+git add package.json package-lock.json Cargo.toml Cargo.lock
+git commit -m "Release 0.2.0"
+git tag v0.2.0
+git push origin main
+git push origin v0.2.0
+```
+
+A stable tag publishes a normal release; versions such as `0.2.0-rc.1` publish a prerelease. Invalid tags and mismatched versions stop before the Mac build. Tags must point to a commit containing this workflow. Existing published releases are never overwritten. An interrupted draft can be resumed by rerunning the failed workflow.
+
+No repository secrets or provider API keys are required: the publish job uses GitHub's built-in token with `contents: write`; build jobs only have read access. Actions are pinned to commit SHAs. The downloads remain unsigned and unnotarized until Apple signing credentials are configured.
+
+For a build-only check, run **Actions → Release macOS → Run workflow**, or:
+
+```sh
+gh workflow run release.yml --ref main
+```
+
+Manual runs execute the same build and test steps and save the downloadable files as Actions artifacts for 14 days. They do not create a tag or release. Failed desktop tests save available screenshots for diagnosis.
+
 ## Verify
 
 ```sh

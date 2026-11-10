@@ -1,0 +1,182 @@
+name: Release macOS
+
+on:
+  push:
+    tags:
+      - "v*"
+  # A manual run builds and tests artifacts without publishing a release.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  validate:
+    name: Validate release version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - name: Test release validation
+        run: node --test tests/release.test.mjs
+      - name: Check tag against npm and Cargo versions
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || '' }}
+        run: node scripts/release-info.mjs
+
+  build:
+    name: Build and test Apple Silicon app
+    needs: validate
+    runs-on: macos-15
+    timeout-minutes: 40
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+      CARGO_TERM_COLOR: always
+      VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          cache: npm
+      - name: Set up Rust and ripgrep
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          test "$(uname -m)" = arm64
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
+          rustup override set 1.95.0
+          if ! command -v rg >/dev/null 2>&1; then brew install ripgrep; fi
+      - name: Install locked npm dependencies
+        run: npm ci
+      - name: Check source and test harness
+        run: |
+          npm run check
+          npm test
+      - name: Build DMG and ZIP
+        run: |
+          npm run build
+          node scripts/prepare-tools.mjs
+          # electron-builder expands the literal placeholders below.
+          # shellcheck disable=SC2016
+          npx --no-install electron-builder --mac dmg zip --arm64 --publish never \
+            --config.directories.output=release/publish \
+            '--config.artifactName=Substrate-${version}-macOS-${arch}.${ext}'
+      - name: Test the packaged app
+        timeout-minutes: 5
+        env:
+          SUBSTRATE_TEST_EXECUTABLE: ${{ github.workspace }}/release/publish/mac-arm64/Substrate.app/Contents/MacOS/Substrate
+        run: npm run test:desktop
+      - name: Verify installer and generate checksums
+        working-directory: release/publish
+        run: |
+          hdiutil verify "Substrate-${VERSION}-macOS-arm64.dmg"
+          python3 -m zipfile --test "Substrate-${VERSION}-macOS-arm64.zip"
+          shasum -a 256 "Substrate-${VERSION}-macOS-arm64.dmg" "Substrate-${VERSION}-macOS-arm64.zip" > SHA256SUMS.txt
+      - name: Upload release downloads
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macOS-arm64
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+          path: |
+            release/publish/Substrate-*.dmg
+            release/publish/Substrate-*.zip
+            release/publish/SHA256SUMS.txt
+      - name: Save desktop diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: desktop-test-diagnostics
+          if-no-files-found: ignore
+          retention-days: 7
+          path: test-results/
+
+  publish:
+    name: Publish GitHub release
+    needs: [validate, build]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+      PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: macOS-arm64
+          path: release-assets
+      - name: Verify downloaded assets
+        working-directory: release-assets
+        run: sha256sum --check SHA256SUMS.txt
+      - name: Create or resume a draft release
+        run: |
+          # A moved tag must not publish binaries from a different commit.
+          tagged_commit=$(gh api "repos/${GH_REPO}/commits/${RELEASE_TAG}" --jq .sha)
+          test "$tagged_commit" = "$GITHUB_SHA"
+
+          if gh release view "$RELEASE_TAG" --json isDraft > release-state.json 2> release-state-error.txt; then
+            if ! jq --exit-status '.isDraft == true' release-state.json >/dev/null; then
+              echo "Release $RELEASE_TAG is already published; leaving it untouched." >&2
+              exit 1
+            fi
+          else
+            # A failure other than a missing release must not be treated as permission to overwrite it.
+            if ! grep -qi 'release not found' release-state-error.txt; then
+              cat release-state-error.txt >&2
+              exit 1
+            fi
+            gh release create "$RELEASE_TAG" --verify-tag --draft \
+              --title "Substrate ${RELEASE_TAG}" --notes-file /dev/null
+          fi
+      - name: Upload and publish verified release
+        run: |
+          cat > release-notes.md <<'NOTES'
+          Native macOS coding workspace powered by Subquadratic's SubQ Preview.
+
+          **Downloads:** Apple Silicon (arm64) DMG, ZIP, and SHA-256 checksums. Open the DMG and drag Substrate to Applications, or extract the ZIP.
+
+          **Requirements:** A Subquadratic API key with SubQ Preview access. Git features require Git. The Rust harness and ripgrep are bundled; Node.js and Cargo are not needed to run the app.
+
+          **Signing:** This build is unsigned and unnotarized.
+
+          **Execution:** Edits and commands require approval. Approved commands run with your host user permissions without an OS sandbox.
+
+          **Validation:** Source checks, Rust unit/integration tests, the packaged Electron app, and installer checks pass before publication. Model tests use local API fixtures; live inference requires your own enabled key.
+          NOTES
+          # The backticks belong to the Markdown, not shell substitution.
+          # shellcheck disable=SC2016
+          printf '\nSource commit: `%s`.\n' "$GITHUB_SHA" >> release-notes.md
+
+          # Only draft assets can be replaced when retrying an interrupted run.
+          gh release upload "$RELEASE_TAG" release-assets/*.dmg release-assets/*.zip release-assets/SHA256SUMS.txt --clobber
+          gh release edit "$RELEASE_TAG" --notes-file release-notes.md \
+            --prerelease="$PRERELEASE" --draft=false --latest="$([[ "$PRERELEASE" == false ]] && echo true || echo false)"
+          gh release view "$RELEASE_TAG" --json url --jq .url >> "$GITHUB_STEP_SUMMARY"
