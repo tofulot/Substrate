@@ -64,6 +64,8 @@ try {
   await app.evaluate(({ dialog }, repo) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [repo] }) }, repo)
   await page.getByRole('button', { name: 'Start by opening a workspace' }).click()
   await expect(page.getByText('workspace', { exact: true }).first()).toBeVisible()
+  // Project selection renders before the Rust session and its first snapshot finish.
+  await page.waitForFunction(() => Boolean(localStorage.getItem('substrate.session')))
   const baseline = await page.evaluate(async () => (await window.substrate.rpc('context.get', { session_id: localStorage.getItem('substrate.session') })).snapshot)
   await page.getByRole('button', { name: /^Settings/ }).click()
   await expect(page.getByLabel('Repository context budget')).toHaveValue('524288')
