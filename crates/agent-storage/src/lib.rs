@@ -235,19 +235,22 @@ impl Storage {
         })
     }
     pub async fn list(&self) -> Result<Vec<Session>> {
-        let ids: Vec<String> = sqlx::query_scalar(
-            "SELECT id FROM sessions ORDER BY updated_at DESC, rowid DESC LIMIT 100",
+        let rows = sqlx::query(
+            "SELECT id, project, title, updated_at FROM sessions ORDER BY updated_at DESC, rowid DESC",
         )
         .fetch_all(&self.pool)
         .await?;
-        let mut out = vec![];
-        for id in ids {
-            let mut s = self.get(&id).await?;
-            s.messages.clear();
-            s.input.clear();
-            out.push(s);
-        }
-        Ok(out)
+        Ok(rows
+            .into_iter()
+            .map(|row| Session {
+                id: row.get("id"),
+                project: row.get("project"),
+                title: row.get("title"),
+                updated_at: row.get("updated_at"),
+                messages: vec![],
+                input: vec![],
+            })
+            .collect())
     }
 }
 
@@ -256,6 +259,35 @@ mod tests {
     use super::*;
     use agent_protocol::{Message, ToolActivity};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn history_includes_chats_beyond_the_previous_limit() {
+        let root = std::env::temp_dir().join(format!("substrate-storage-{}", uuid::Uuid::new_v4()));
+        let storage = Storage::open(&root.join("data.db")).await.unwrap();
+        let mut oldest = storage.create("/older-project".into()).await.unwrap();
+        oldest.messages.push(Message {
+            id: "first-message".into(),
+            role: "user".into(),
+            content: "Older conversation".into(),
+            tool: None,
+        });
+        storage.save(&oldest).await.unwrap();
+        for _ in 0..100 {
+            storage.create("/newer-project".into()).await.unwrap();
+        }
+
+        let history = storage.list().await.unwrap();
+        assert_eq!(history.len(), 101);
+        let entry = history.last().unwrap();
+        assert_eq!(entry.id, oldest.id);
+        assert_eq!(entry.project, "/older-project");
+        assert!(entry.messages.is_empty());
+        assert_eq!(storage.get(&oldest.id).await.unwrap().messages.len(), 1);
+
+        storage.pool.close().await;
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
     #[tokio::test]
     async fn crash_recovery_closes_orphan_calls_without_replaying_them() {
         let root = std::env::temp_dir().join(format!("substrate-storage-{}", uuid::Uuid::new_v4()));

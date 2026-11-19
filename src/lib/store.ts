@@ -8,6 +8,7 @@ import type {
   Session,
   ToolActivity,
 } from "../../shared/types";
+import { workspaceName } from "./utils";
 export const api = window.substrate;
 interface State {
   project: Project | null;
@@ -15,6 +16,7 @@ interface State {
   sessions: Session[];
   config: Config | null;
   running: string | null;
+  navigating: boolean;
   error: string | null;
   connected: boolean;
   settings: boolean;
@@ -37,6 +39,7 @@ export const useStore = create<State>((set, get) => ({
   sessions: [],
   config: null,
   running: null,
+  navigating: false,
   error: null,
   connected: false,
   settings: false,
@@ -58,7 +61,7 @@ export const useStore = create<State>((set, get) => ({
       ]);
       set({ connected: true, config, sessions });
       const last = localStorage.getItem("substrate.session");
-      if (last && sessions.some((s) => s.id === last))
+      if (last && !get().navigating && sessions.some((s) => s.id === last))
         await get().selectSession(last);
     } catch (error) {
       get().setError(error);
@@ -69,62 +72,36 @@ export const useStore = create<State>((set, get) => ({
   },
   openProject: async () => {
     try {
-      await switchProject(() => api.openProject());
+      await navigate(() => switchProject(() => api.openProject()));
     } catch (error) {
       get().setError(error);
     }
   },
-  createProject: (name) => switchProject(() => api.createProject(name)),
+  createProject: (name) =>
+    navigate(() => switchProject(() => api.createProject(name))),
   selectSession: async (id) => {
+    if (get().session?.id === id) return;
     try {
-      if (get().running && get().running !== id)
-        throw new Error(
-          "Stop the current task before switching conversations.",
-        );
-      const [session, branch] = await Promise.all([
-        api.rpc<Session>("session.resume", { session_id: id }),
-        api.rpc<string | null>("git.branch", { session_id: id }),
-      ]);
-      // Project identity is restored from the database, never from an arbitrary renderer path.
-      const path = session.project;
-      const name = path.split(/[\\/]/).pop() || "Workspace";
-      set({
-        session,
-        project: { path, name, branch },
-        running: session.running ? id : null,
-        error: null,
-        terminalOutput: "",
-        revision: get().revision + 1,
-      });
-      localStorage.setItem("substrate.session", id);
+      await navigate(() => resumeSession(id));
     } catch (error) {
       get().setError(error);
     }
   },
   newSession: async () => {
     try {
-      if (get().running)
-        throw new Error(
-          "Stop the current task before creating a conversation.",
-        );
       const project = get().project;
-      if (!project) {
-        await get().openProject();
-        return;
-      }
-      const session = await api.rpc<Session>("session.create", {
-        project: project.path,
-      });
-      set({ session, error: null, terminalOutput: "" });
-      localStorage.setItem("substrate.session", session.id);
-      await get().refreshSessions();
+      await navigate(() =>
+        project
+          ? createSession(project)
+          : switchProject(() => api.openProject()),
+      );
     } catch (error) {
       get().setError(error);
     }
   },
   send: async (task, approvalMode) => {
-    const { session, running, config } = get();
-    if (running || !task.trim()) return;
+    const { session, running, navigating, config } = get();
+    if (running || navigating || !task.trim()) return;
     if (!config?.has_key) {
       set({ settings: true });
       return;
@@ -234,18 +211,60 @@ export const useStore = create<State>((set, get) => ({
 }));
 
 async function switchProject(load: () => Promise<Project | null>) {
-  if (useStore.getState().running)
-    throw new Error("Stop the current task before switching workspaces.");
   const project = await load();
   if (!project) return;
-  const { sessions, revision, selectSession, newSession } = useStore.getState();
-  useStore.setState({
-    project,
+  const existing = useStore
+    .getState()
+    .sessions.find((s) => s.project === project.path);
+  if (existing) await resumeSession(existing.id, project);
+  else await createSession(project);
+}
+
+async function navigate(load: () => Promise<void>) {
+  const { navigating, running } = useStore.getState();
+  if (running)
+    throw new Error(
+      "Stop the current task before switching conversations or workspaces.",
+    );
+  if (navigating) throw new Error("A conversation is already opening.");
+  useStore.setState({ navigating: true });
+  try {
+    await load();
+  } finally {
+    useStore.setState({ navigating: false });
+  }
+}
+
+async function resumeSession(id: string, project?: Project) {
+  // The saved conversation remains readable if its folder has moved or been deleted.
+  const [session, branch] = await Promise.all([
+    api.rpc<Session>("session.resume", { session_id: id }),
+    project
+      ? project.branch
+      : api
+          .rpc<string | null>("git.branch", { session_id: id })
+          .catch(() => null),
+  ]);
+  activateSession(session, branch);
+}
+
+async function createSession(project: Project) {
+  const session = await api.rpc<Session>("session.create", {
+    project: project.path,
+  });
+  activateSession(session, project.branch);
+  await useStore.getState().refreshSessions();
+}
+
+function activateSession(session: Session, branch: string | null) {
+  const path = session.project;
+  useStore.setState((state) => ({
+    session,
+    project: { path, name: workspaceName(path), branch },
+    running: session.running ? session.id : null,
     error: null,
     terminalOutput: "",
-    revision: revision + 1,
-  });
-  const existing = sessions.find((s) => s.project === project.path);
-  if (existing) await selectSession(existing.id);
-  else await newSession();
+    revision: state.revision + 1,
+  }));
+  localStorage.setItem("substrate.session", session.id);
 }

@@ -21,7 +21,7 @@ await writeFile(join(repo, '.gitignore'), '.env\n')
 let round = 0
 let snapCalls = 0
 const mac = process.platform === 'darwin'
-const commandCheck = (mac ? 'command -v mount >/dev/null && ' : '') + 'echo "Desktop integration verified"'
+const commandCheck = (mac ? 'command -v mount >/dev/null && ' : '') + "grep -q 'export const hello = \"substrate\"' hello.ts && echo 'Desktop integration verified'"
 const devRg = mac && !process.env.SUBSTRATE_TEST_EXECUTABLE
   ? process.env.SUBSTRATE_RG ?? execFileSync('which', ['rg'], { encoding: 'utf8' }).trim()
   : undefined
@@ -55,10 +55,10 @@ const server = createServer(async (req, res) => {
     ['search_repository', { query: 'export const' }],
     ['read_file', { path: 'hello.ts' }],
     ['apply_patch', { path: 'hello.ts', old_text: '"world"', new_text: '"substrate"' }],
-    ['execute_command', { command: commandCheck }],
+    ['run_check', { command: commandCheck, purpose: 'Verify the updated export' }],
     null,
     ['apply_patch', { path: 'automatic.ts', old_text: '', new_text: 'export const applied = true\n' }],
-    ['execute_command', { command: 'echo "Automatic edit verified"' }]
+    ['run_check', { command: "grep -qx 'export const applied = true' automatic.ts", purpose: 'Verify the automatic code edit' }]
   ]
   res.writeHead(200, { 'Content-Type': 'text/event-stream' })
   if (rounds[round]) {
@@ -149,7 +149,8 @@ try {
   await page.getByRole('button', { name: 'Review', exact: true }).click()
   await page.getByRole('button', { name: 'Approve edit' }).click()
   await page.getByRole('button', { name: 'Review', exact: true }).click()
-  await expect(page.getByText(commandCheck, { exact: true })).toBeVisible()
+  await expect(page.getByRole('dialog').locator('.command-preview')).toHaveText(`$ ${commandCheck}`)
+  await expect(page.getByText('Verify the updated export', { exact: true })).toBeVisible()
   await page.getByRole('button', { name: 'Approve command' }).click()
   await expect(page.getByText('All systems quiet')).toBeVisible({ timeout: 15000 })
   expect(await readFile(join(repo, 'hello.ts'), 'utf8')).toContain('"substrate"')
@@ -220,6 +221,33 @@ try {
   await expect(page.locator('.workspace-card')).toContainText('A new project')
   const newSession = await page.evaluate(() => window.substrate.rpc('session.resume', { session_id: localStorage.getItem('substrate.session') }))
   expect(newSession.project).toBe(newProject)
+  const history = page.getByRole('navigation', { name: 'Chat history' })
+  const newProjectChats = history.getByRole('list', { name: 'A new project chats' })
+  const originalChats = history.getByRole('list', { name: 'workspace chats' })
+  const originalChat = originalChats.getByRole('button', { name: 'Update hello and verify it' })
+  await expect(newProjectChats.getByRole('button', { name: 'New conversation' })).toHaveAttribute('aria-current', 'true')
+  await expect(originalChat).toBeVisible()
+  await page.getByRole('button', { name: 'New conversation' }).first().click()
+  await expect(newProjectChats.getByRole('button', { name: 'New conversation' })).toHaveCount(2)
+  await page.getByRole('textbox', { name: 'Message Substrate' }).fill('Draft for the new project')
+  await history.getByRole('button', { name: 'workspace', exact: true }).click()
+  await expect(originalChat).toBeHidden()
+  await page.getByRole('button', { name: 'Search chat history' }).click()
+  const historySearch = page.getByRole('searchbox', { name: 'Search by project or chat title' })
+  await historySearch.fill('A new project')
+  await expect(newProjectChats.getByRole('button')).toHaveCount(2)
+  await expect(originalChats).toBeHidden()
+  await historySearch.fill('verify it')
+  await expect(newProjectChats).toBeHidden()
+  await originalChat.click()
+  await expect(originalChat).toHaveAttribute('aria-current', 'true')
+  await expect(page.locator('.message-assistant').last()).toContainText('Applied the code edit.')
+  await expect(page.getByRole('textbox', { name: 'Message Substrate' })).toHaveValue('')
+  await page.getByRole('button', { name: 'Search chat history' }).click()
+  await newProjectChats.getByRole('button', { name: 'New conversation' }).first().click()
+  await expect(page.getByRole('textbox', { name: 'Message Substrate' })).toHaveValue('Draft for the new project')
+  await newProjectChats.getByRole('button', { name: 'New conversation' }).last().click()
+  await expect.poll(() => page.evaluate(() => localStorage.getItem('substrate.session'))).toBe(newSession.id)
   await newFolder.click()
   await folderName.fill('A new project')
   await createFolder.click()
@@ -230,9 +258,12 @@ try {
   app = await electron.launch(launchOptions)
   const reopened = await app.firstWindow()
   await expect(reopened.locator('.workspace-card')).toContainText('A new project')
+  const reopenedHistory = reopened.getByRole('navigation', { name: 'Chat history' })
+  await expect(reopenedHistory.getByRole('list', { name: 'A new project chats' }).getByRole('button')).toHaveCount(2)
+  await expect(reopenedHistory.getByRole('list', { name: 'workspace chats' }).getByRole('button', { name: 'Update hello and verify it' })).toBeVisible()
   const restoredSessionId = await reopened.evaluate(() => localStorage.getItem('substrate.session'))
   expect(restoredSessionId).toBe(newSession.id)
-  console.log('PASS: Electron → preload → Rust → SubQ fixture; folder creation, migration, files, approvals, Monaco diff, terminal, persistence and renderer isolation')
+  console.log('PASS: Electron → preload → Rust → SubQ fixture; project chat history, folder creation, migration, files, approvals, Monaco diff, terminal, persistence and renderer isolation')
 } finally {
   await app?.close()
   await new Promise(r => server.close(r))

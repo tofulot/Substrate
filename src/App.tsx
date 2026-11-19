@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import {
   Activity,
@@ -37,8 +37,9 @@ import {
 } from "lucide-react";
 import Markdown from "react-markdown";
 import { version as appVersion } from "../package.json";
-import type { ApprovalMode } from "../shared/types";
+import type { ApprovalMode, Session } from "../shared/types";
 import { api, useStore } from "./lib/store";
+import { workspaceName } from "./lib/utils";
 import { Button } from "./components/ui/button";
 import Settings from "./components/Settings";
 import type { Change, FileEntry, Preview, ToolActivity } from "./view-types";
@@ -66,6 +67,7 @@ const toolNames: Record<string, string> = {
   search_repository: "Search repository",
   apply_patch: "Edit file",
   execute_command: "Run command",
+  run_check: "Run verification check",
   verify_npm_app: "Verify app launch",
   git_diff: "Inspect changes",
 };
@@ -293,10 +295,16 @@ export default function App() {
     config,
     connected,
     running,
+    navigating,
     error,
     revision,
   } = useStore();
-  const [draft, setDraft] = useState("");
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const draftKey = session?.id ?? "";
+  const draft = drafts[draftKey] ?? "";
+  function setDraft(value: string) {
+    setDrafts((current) => ({ ...current, [draftKey]: value }));
+  }
   const [approvalMode, setApprovalMode] = useState<ApprovalMode>("ask");
   const [sidebar, setSidebar] = useState(true);
   const [panel, setPanel] = useState(false);
@@ -311,6 +319,7 @@ export default function App() {
   const [approving, setApproving] = useState(false);
   const [query, setQuery] = useState("");
   const [searching, setSearching] = useState(false);
+  const [collapsedProjects, setCollapsedProjects] = useState(() => new Set<string>());
   const scroll = useRef<HTMLDivElement>(null);
   const input = useRef<HTMLTextAreaElement>(null);
   const stick = useRef(true);
@@ -325,6 +334,29 @@ export default function App() {
     void useStore.getState().init();
     return off;
   }, []);
+  useEffect(() => {
+    stick.current = true;
+    if (session) {
+      const path = session.project;
+      setCollapsedProjects((current) => {
+        if (!current.has(path)) return current;
+        const next = new Set(current);
+        next.delete(path);
+        return next;
+      });
+    }
+  }, [session?.id, session?.project]);
+  useEffect(() => {
+    if (!draftKey) return;
+    setDrafts((current) => {
+      const { "": welcomeDraft, ...chatDrafts } = current;
+      if (!welcomeDraft) return current;
+      return {
+        ...chatDrafts,
+        [draftKey]: chatDrafts[draftKey] ?? welcomeDraft,
+      };
+    });
+  }, [draftKey]);
   useEffect(() => {
     function shortcuts(event: KeyboardEvent) {
       if (event.metaKey || event.ctrlKey) {
@@ -446,7 +478,7 @@ export default function App() {
     }
   }
   function submit() {
-    if (!draft.trim() || running) return;
+    if (!draft.trim() || running || navigating) return;
     if (!config?.has_key) {
       useStore.setState({ settings: true });
       return;
@@ -460,12 +492,22 @@ export default function App() {
     stick.current = true;
     void useStore.getState().send(task, approvalMode);
   }
-  const projectGroups = [...new Set(sessions.map((s) => s.project))];
-  const visibleSessions = sessions.filter(
-    (s) =>
-      (!project || s.project === project.path) &&
-      s.title.toLowerCase().includes(query.toLowerCase()),
-  );
+  const searchTerm = query.trim().toLowerCase();
+  const projectGroups = useMemo(() => {
+    const groups = new Map<string, Session[]>();
+    for (const chat of sessions) {
+      if (
+        !chat.project.toLowerCase().includes(searchTerm) &&
+        !chat.title.toLowerCase().includes(searchTerm)
+      )
+        continue;
+      const group = groups.get(chat.project);
+      if (group) group.push(chat);
+      else groups.set(chat.project, [chat]);
+    }
+    return [...groups];
+  }, [sessions, searchTerm]);
+  const navigationDisabled = !connected || !!running || navigating;
   const hasMessages = !!session?.messages.length;
   return (
     <div
@@ -492,6 +534,7 @@ export default function App() {
         <div className="sidebar-actions">
           <button
             className="new-chat"
+            disabled={navigationDisabled}
             onClick={() => void useStore.getState().newSession()}
           >
             <Plus size={17} />
@@ -500,9 +543,13 @@ export default function App() {
           </button>
           <button
             className="search-button"
-            onClick={() => setSearching(!searching)}
-            aria-label="Search conversations"
-            title="Search conversations"
+            onClick={() => {
+              setSearching(!searching);
+              setQuery("");
+            }}
+            aria-expanded={searching}
+            aria-label="Search chat history"
+            title="Search chat history"
           >
             <Search size={16} />
           </button>
@@ -511,17 +558,23 @@ export default function App() {
           <input
             className="conversation-search"
             autoFocus
-            placeholder="Find a conversation…"
+            type="search"
+            aria-label="Search by project or chat title"
+            placeholder="Find a project or chat…"
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => {
+              setQuery(e.target.value);
+              if (collapsedProjects.size) setCollapsedProjects(new Set());
+            }}
           />
         )}
         <div className="sidebar-section-label">
           WORKSPACE
-          <NewWorkspaceButton disabled={!connected || !!running} />
+          <NewWorkspaceButton disabled={navigationDisabled} />
         </div>
         <button
           className={`workspace-card ${project ? "selected" : ""}`}
+          disabled={navigationDisabled}
           onClick={() => void useStore.getState().openProject()}
           title="Open workspace (⌘O)"
         >
@@ -530,60 +583,90 @@ export default function App() {
           </span>
           <span>
             <strong>{project?.name || "Open a workspace"}</strong>
-            <small>
-              {project ? "Local folder" : "Bring your code along"}
-            </small>
+            <small>{project ? "Local folder" : "Bring your code along"}</small>
           </span>
           <ChevronDown size={13} />
         </button>
-        <div className="sidebar-section-label conversations-label">
-          CONVERSATIONS<span>{visibleSessions.length || ""}</span>
+        <div className="sidebar-section-label" id="chat-history-label">
+          CHAT HISTORY
         </div>
-        <nav className="conversation-list" aria-label="Conversations">
-          {visibleSessions.map((s) => (
-            <button
-              className={`conversation-row ${s.id === session?.id ? "active" : ""}`}
-              key={s.id}
-              onClick={() => void useStore.getState().selectSession(s.id)}
-            >
-              <MessageSquare size={14} />
-              <span>{s.title}</span>
-              {running === s.id && <span className="activity-dot" />}
-            </button>
-          ))}
-          {!visibleSessions.length && (
-            <div className="no-conversations">
-              <MessageSquare size={20} />
-              <p>
-                {query ? "No matching conversations." : "A fresh start."}
-                <br />
-                {query
-                  ? "Try another search."
-                  : "Your conversations will live here."}
-              </p>
-            </div>
+        <nav className="conversation-list" aria-labelledby="chat-history-label">
+          {projectGroups.length ? (
+            <ul>
+              {projectGroups.map(([path, chats]) => {
+                const name = workspaceName(path);
+                const expanded = !collapsedProjects.has(path);
+                return (
+                  <li className="history-project" key={path}>
+                    <button
+                      className={`history-project-toggle ${path === project?.path ? "active" : ""}`}
+                      aria-expanded={expanded}
+                      title={path}
+                      onClick={() =>
+                        setCollapsedProjects((current) => {
+                          const next = new Set(current);
+                          if (next.has(path)) next.delete(path);
+                          else next.add(path);
+                          return next;
+                        })
+                      }
+                    >
+                      {expanded ? (
+                        <ChevronDown size={12} />
+                      ) : (
+                        <ChevronRight size={12} />
+                      )}
+                      {expanded ? (
+                        <FolderOpen size={15} />
+                      ) : (
+                        <Folder size={15} />
+                      )}
+                      <span>{name}</span>
+                    </button>
+                    {expanded && (
+                      <ul
+                        className="history-chats"
+                        aria-label={`${name} chats`}
+                      >
+                        {chats.map((chat) => {
+                          const active = session?.id === chat.id;
+                          const title = active ? session.title : chat.title;
+                          return (
+                            <li key={chat.id}>
+                              <button
+                                className={`conversation-row ${active ? "active" : ""}`}
+                                aria-current={active ? "true" : undefined}
+                                title={title}
+                                disabled={navigationDisabled && !active}
+                                onClick={() =>
+                                  void useStore
+                                    .getState()
+                                    .selectSession(chat.id)
+                                }
+                              >
+                                <MessageSquare size={14} />
+                                <span>{title}</span>
+                                {running === chat.id && (
+                                  <span className="activity-dot" />
+                                )}
+                              </button>
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          ) : (
+            <p className="no-conversations">
+              {searchTerm
+                ? "No matching projects or chats."
+                : "No saved chats yet."}
+            </p>
           )}
         </nav>
-        {projectGroups.filter((p) => p !== project?.path).length > 0 && (
-          <div className="other-workspaces">
-            <div className="sidebar-section-label">RECENT WORKSPACES</div>
-            {projectGroups
-              .filter((p) => p !== project?.path)
-              .slice(0, 4)
-              .map((p) => (
-                <button
-                  key={p}
-                  onClick={() => {
-                    const s = sessions.find((s) => s.project === p);
-                    if (s) void useStore.getState().selectSession(s.id);
-                  }}
-                >
-                  <Folder size={14} />
-                  {p.split("/").pop()}
-                </button>
-              ))}
-          </div>
-        )}
         <div className="sidebar-bottom">
           <div className="local-note">
             <span className="tiny-orbit" />
@@ -884,7 +967,7 @@ export default function App() {
                 ) : (
                   <button
                     className="send-button"
-                    disabled={!draft.trim() || !connected}
+                    disabled={!draft.trim() || navigationDisabled}
                     aria-label="Send message"
                     onClick={submit}
                   >
@@ -1117,6 +1200,9 @@ export default function App() {
                 ? activeApproval.preview.path
                 : "This command runs on your machine with your user permissions, outside an OS sandbox."}
             </Dialog.Description>
+            {activeApproval?.name === "run_check" && (
+              <p>{String(activeApproval.arguments.purpose)}</p>
+            )}
             {activeApproval?.preview ? (
               <div className="approval-editor">
                 <Suspense
