@@ -382,6 +382,7 @@ mod context_trace_tests {
                 tool_calls: 0,
                 tool_ms: 0,
                 approval_wait_ms: 0,
+                context_reads: Default::default(),
             })
             .await
             .unwrap();

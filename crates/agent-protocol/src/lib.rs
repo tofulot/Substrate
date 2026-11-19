@@ -22,6 +22,13 @@ impl Request {
         Ok(request)
     }
 }
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalMode {
+    #[default]
+    Ask,
+    ApproveEdits,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Preview {
     pub path: String,
@@ -134,6 +141,20 @@ pub struct RunTrace {
     pub tool_calls: u64,
     pub tool_ms: u64,
     pub approval_wait_ms: u64,
+    #[serde(default)]
+    pub context_reads: ContextReads,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ContextReads {
+    pub successful: u64,
+    pub missed: u64,
+    pub missed_paths: Vec<MissedFile>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MissedFile {
+    pub path: String,
+    pub snapshot_id: String,
+    pub eligible: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FileVersion {
@@ -184,6 +205,8 @@ pub struct ContextSelection {
     pub snap_files: u64,
     pub reason: Option<String>,
     pub ranks: Vec<FileRank>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub promoted_paths: Vec<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FileRank {

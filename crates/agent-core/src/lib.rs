@@ -1,6 +1,7 @@
 use agent_models::{DECISION_MODEL, ModelProvider, Subquadratic};
 use agent_protocol::{
-    CallTrace, ContextSelection, Message, ModelMetrics, RunTrace, Session, ToolActivity,
+    ApprovalMode, CallTrace, ContextSelection, Message, MissedFile, ModelMetrics, RunTrace,
+    Session, ToolActivity,
 };
 use agent_runtime::Runtime;
 use agent_storage::Storage;
@@ -17,6 +18,8 @@ pub struct RunConfig {
     pub model: String,
     pub max_steps: usize,
     pub context_budget_bytes: usize,
+    pub use_snap: bool,
+    pub approval_mode: ApprovalMode,
 }
 pub async fn capture_context(
     session: &Session,
@@ -32,6 +35,8 @@ struct SelectionRun<'a> {
     run_id: &'a str,
     task: &'a str,
     cache: &'a mut Option<ContextSelection>,
+    use_snap: bool,
+    promoted: &'a [String],
 }
 async fn capture_context_inner(
     session: &Session,
@@ -62,12 +67,16 @@ async fn capture_context_inner(
                     .and_then(|s| s.selection.as_ref())
                     .filter(|s| s.strategy == "snap" || s.strategy == "snap_with_fallback")
             })
-            .filter(|s| s.task_hash == task_hash && s.inventory_digest == inventory.digest);
-        let selected = if let Some(selection) = reusable {
+            .filter(|s| {
+                (selector.use_snap || s.strategy == "local")
+                    && s.task_hash == task_hash
+                    && s.inventory_digest == inventory.digest
+            });
+        let mut selected = if let Some(selection) = reusable {
             selection.clone()
         } else {
             let local = agent_context::local_selection(&inventory, selector.task);
-            if local.ranks.is_empty() {
+            if !selector.use_snap || local.ranks.is_empty() {
                 local
             } else {
                 let (state, questions) =
@@ -132,6 +141,14 @@ async fn capture_context_inner(
             }
         };
         *selector.cache = Some(selected.clone());
+        selected.promoted_paths = selector
+            .promoted
+            .iter()
+            .rev()
+            .filter(|path| selected.ranks.iter().any(|rank| &rank.path == *path))
+            .take(16)
+            .cloned()
+            .collect();
         selected
     } else {
         previous
@@ -258,6 +275,7 @@ pub async fn run(
         tool_calls: 0,
         tool_ms: 0,
         approval_wait_ms: 0,
+        context_reads: Default::default(),
     };
     storage.save_run(&run_trace).await?;
     if session.messages.is_empty() {
@@ -338,9 +356,14 @@ async fn loop_run(
     run_trace: &mut RunTrace,
 ) -> Result<()> {
     let root = agent_tools::workspace(&session.project)?;
-    let instructions = agent_context::instructions(&session.project);
+    let instructions = agent_context::instructions(&session.project, config.approval_mode);
+    let check_new_npm_app = cfg!(unix) && agent_tools::npm_start_script(&root).await.is_none();
+    let mut verified_inventory = None;
+    let mut premature_finishes = 0;
+    let mut verification_failure = None;
     let task = selection_task(session);
     let mut selection_cache = None;
+    let mut promoted = Vec::new();
     for _ in 0..config.max_steps {
         ensure!(!cancel.is_cancelled(), "Interrupted");
         ensure!(
@@ -358,9 +381,26 @@ async fn loop_run(
                 run_id: &run_trace.id,
                 task: &task,
                 cache: &mut selection_cache,
+                use_snap: config.use_snap,
+                promoted: &promoted,
             }),
         )
         .await?;
+        let needs_verification = check_new_npm_app
+            && agent_tools::npm_start_script(&root).await.is_some()
+            && (verified_inventory.is_none()
+                || verified_inventory.as_ref()
+                    != packet
+                        .manifest
+                        .selection
+                        .as_ref()
+                        .map(|s| &s.inventory_digest));
+        let mut instructions = instructions.clone();
+        if needs_verification {
+            instructions.push_str(
+                "\nThe new npm app has no successful dependency and startup verification for its current workspace. Use verify_npm_app after installing dependencies. If verification fails, fix the reported issue before finishing. If approval was declined, report it as a blocker.",
+            );
+        }
         runtime.emit("context.updated",json!({"session_id":session.id,"snapshot_id":packet.manifest.id,"revision":packet.manifest.revision})).await;
         let mut versions = read_versions(&session.input);
         for file in &packet.manifest.files {
@@ -400,11 +440,13 @@ async fn loop_run(
             let mut text = String::new();
             while let Some(delta) = rx.recv().await {
                 text.push_str(&delta);
-                rt.emit(
-                    "agent.message.delta",
-                    json!({"session_id":sid,"message_id":mid,"delta":delta}),
-                )
-                .await;
+                if !needs_verification {
+                    rt.emit(
+                        "agent.message.delta",
+                        json!({"session_id":sid,"message_id":mid,"delta":delta}),
+                    )
+                    .await;
+                }
             }
             text
         });
@@ -442,7 +484,29 @@ async fn loop_run(
                 json!({"session_id":session.id,"call_id":trace.id}),
             )
             .await;
+        if needs_verification && trace.tool_calls == 0 && output.output.is_ok() {
+            premature_finishes += 1;
+            if premature_finishes >= 2
+                || verification_failure.as_deref() == Some("Launch verification was declined.")
+            {
+                anyhow::bail!(
+                    "The app has not passed dependency and startup verification. {}",
+                    verification_failure
+                        .as_deref()
+                        .unwrap_or("The model stopped before running verify_npm_app.")
+                );
+            }
+            continue;
+        }
         if !text.is_empty() {
+            if needs_verification {
+                runtime
+                    .emit(
+                        "agent.message.delta",
+                        json!({"session_id":session.id,"message_id":message_id,"delta":text}),
+                    )
+                    .await;
+            }
             session.messages.push(Message {
                 id: message_id.clone(),
                 role: "assistant".into(),
@@ -481,24 +545,79 @@ async fn loop_run(
                 serde_json::from_str(call["arguments"].as_str().unwrap_or("{}"));
             run_trace.tool_calls += 1;
             let result = match args {
-                Ok(args) => {
-                    run_tool(
-                        session,
-                        name,
-                        args,
-                        storage,
-                        runtime,
-                        cancel,
-                        &mut ToolContext {
-                            root: &root,
-                            versions: &versions,
-                            trace: run_trace,
-                        },
-                    )
-                    .await
-                }
+                Ok(args) => run_tool(
+                    session,
+                    name,
+                    &args,
+                    storage,
+                    runtime,
+                    cancel,
+                    &mut ToolContext {
+                        root: &root,
+                        versions: &versions,
+                        trace: run_trace,
+                        approval_mode: config.approval_mode,
+                    },
+                )
+                .await
+                .inspect(|_| {
+                    if name == "read_file"
+                        && let Some(path) = args["path"].as_str()
+                    {
+                        let path = context_key(path);
+                        let reads = &mut run_trace.context_reads;
+                        reads.successful += 1;
+                        if !packet.manifest.files.iter().any(|file| file.path == path) {
+                            reads.missed += 1;
+                            let eligible =
+                                packet.manifest.selection.as_ref().is_some_and(|selection| {
+                                    selection.ranks.iter().any(|rank| rank.path == path)
+                                });
+                            if reads.missed_paths.len() < 64
+                                && !reads.missed_paths.iter().any(|miss| miss.path == path)
+                            {
+                                reads.missed_paths.push(MissedFile {
+                                    path: path.clone(),
+                                    snapshot_id: packet.manifest.id.clone(),
+                                    eligible,
+                                });
+                            }
+                            if eligible {
+                                promoted.retain(|prior| prior != &path);
+                                promoted.push(path);
+                                if promoted.len() > 16 {
+                                    promoted.remove(0);
+                                }
+                            }
+                        }
+                    }
+                }),
                 Err(e) => Err(e.into()),
             };
+            if name == "verify_npm_app" {
+                match &result {
+                    Ok(value) if value["verified"] == true => {
+                        let root = root.clone();
+                        let cancel = cancel.clone();
+                        verified_inventory = Some(
+                            tokio::task::spawn_blocking(move || {
+                                agent_context::inventory(&root, &cancel)
+                                    .map(|inventory| inventory.digest)
+                            })
+                            .await??,
+                        );
+                        verification_failure = None;
+                    }
+                    Ok(value) if value["rejected"] == true => {
+                        verification_failure = Some("Launch verification was declined.".into());
+                    }
+                    Err(error) => {
+                        verification_failure =
+                            Some(agent_context::bounded(&error.to_string(), 512).to_owned());
+                    }
+                    _ => {}
+                }
+            }
             let output = match result {
                 Ok(v) => v.to_string(),
                 Err(e) => json!({"error":e.to_string()}).to_string(),
@@ -519,20 +638,21 @@ struct ToolContext<'a> {
     root: &'a std::path::Path,
     versions: &'a HashMap<String, String>,
     trace: &'a mut RunTrace,
+    approval_mode: ApprovalMode,
 }
 async fn run_tool(
     session: &mut Session,
     name: &str,
-    args: Value,
+    args: &Value,
     storage: &Storage,
     runtime: &Runtime,
     cancel: &CancellationToken,
     context: &mut ToolContext<'_>,
 ) -> Result<Value> {
     let root = context.root;
-    agent_tools::validate(name, &args)?;
+    agent_tools::validate(name, args)?;
     let preview = if name == "apply_patch" {
-        let path = agent_tools::string(&args, "path")?;
+        let path = agent_tools::string(args, "path")?;
         let file = agent_tools::resolve(root, path)?;
         let expected = context.versions.get(&context_key(path));
         if file.exists() || expected.is_some() {
@@ -545,7 +665,7 @@ async fn run_tool(
                 "File changed since the model read it; refresh context or read it again before editing"
             );
         }
-        let preview = agent_tools::preview(root, &args).await?;
+        let preview = agent_tools::preview(root, args).await?;
         if let Some(expected) = expected {
             ensure!(
                 agent_context::hash(preview.before.as_bytes()) == *expected,
@@ -556,12 +676,29 @@ async fn run_tool(
     } else {
         None
     };
-    let sensitive = matches!(name, "apply_patch" | "execute_command");
+    let launch_manifest = if name == "verify_npm_app" {
+        Some(agent_tools::read(root, "package.json").await?)
+    } else {
+        None
+    };
+    let requires_approval = matches!(name, "execute_command" | "verify_npm_app")
+        || (name == "apply_patch" && context.approval_mode == ApprovalMode::Ask);
     let mut tool = ToolActivity {
         id: id(),
         name: name.into(),
-        arguments: args.clone(),
-        status: if sensitive { "approval" } else { "running" }.into(),
+        arguments: if let Some(manifest) = &launch_manifest {
+            let manifest: Value = serde_json::from_str(manifest)?;
+            let start = agent_tools::string(&manifest["scripts"], "start")?;
+            json!({"command":format!("npm ls --depth=0\nnpm outdated --depth=0\nnpm start\n  {start}")})
+        } else {
+            args.clone()
+        },
+        status: if requires_approval {
+            "approval"
+        } else {
+            "running"
+        }
+        .into(),
         output: None,
         preview,
     };
@@ -573,7 +710,7 @@ async fn run_tool(
         tool: Some(tool.clone()),
     });
     // Register before publishing the request so a fast UI response cannot race the waiter.
-    let approval = if sensitive {
+    let approval = if requires_approval {
         Some(runtime.register_approval(&session.id, &tool.id).await)
     } else {
         None
@@ -581,7 +718,7 @@ async fn run_tool(
     storage.save(session).await?;
     runtime
         .emit(
-            if sensitive {
+            if requires_approval {
                 "tool.approval.required"
             } else {
                 "tool.started"
@@ -631,8 +768,17 @@ async fn run_tool(
     let result = if let Some(p) = &tool.preview {
         drop(tx);
         agent_tools::apply(root, p).await
+    } else if let Some(manifest) = launch_manifest {
+        match agent_tools::read(root, "package.json").await {
+            Ok(current) if current == manifest => {
+                agent_tools::verify_npm_app(root, cancel, tx).await
+            }
+            _ => Err(anyhow::anyhow!(
+                "package.json changed during approval. Review the new start script before launching."
+            )),
+        }
     } else {
-        agent_tools::execute(root, name, &args, cancel, tx).await
+        agent_tools::execute(root, name, args, cancel, tx).await
     };
     forward.await?;
     context.trace.tool_ms += executing.elapsed().as_millis() as u64;
@@ -675,6 +821,7 @@ mod tests {
             tool_calls: 0,
             tool_ms: 0,
             approval_wait_ms: 0,
+            context_reads: Default::default(),
         }
     }
     struct RecoveringModel(AtomicUsize);
@@ -732,6 +879,8 @@ mod tests {
             key: String::new(),
             model: "subq-preview".into(),
             max_steps: 3,
+            use_snap: true,
+            approval_mode: ApprovalMode::Ask,
             context_budget_bytes: agent_context::DEFAULT_REPO_BUDGET,
         };
         let model = RecoveringModel(AtomicUsize::new(0));
@@ -774,7 +923,7 @@ mod tests {
         let result = run_tool(
             &mut session,
             "apply_patch",
-            json!({"path":"new.txt","old_text":"","new_text":"text"}),
+            &json!({"path":"new.txt","old_text":"","new_text":"text"}),
             &storage,
             &runtime,
             &CancellationToken::new(),
@@ -782,6 +931,7 @@ mod tests {
                 root: &root,
                 versions: &HashMap::new(),
                 trace: &mut test_trace("test"),
+                approval_mode: ApprovalMode::Ask,
             },
         )
         .await
@@ -801,6 +951,8 @@ mod tests {
             key: String::new(),
             model: "subq-preview".into(),
             max_steps: 3,
+            use_snap: true,
+            approval_mode: ApprovalMode::Ask,
             context_budget_bytes: agent_context::DEFAULT_REPO_BUDGET,
         };
         assert!(

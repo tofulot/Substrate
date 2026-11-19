@@ -362,6 +362,25 @@ export default function Insights({
               {duration(run.tool_ms)} tool execution ·{" "}
               {duration(run.approval_wait_ms)} approval wait
             </span>
+            {!!run.context_reads?.successful && (
+              <span>
+                {run.context_reads.missed} of {run.context_reads.successful}{" "}
+                file reads were outside the snapshot
+              </span>
+            )}
+            {!!run.context_reads?.missed_paths.length && (
+              <details>
+                <summary>Files read outside the snapshot</summary>
+                <ul>
+                  {run.context_reads.missed_paths.map((miss) => (
+                    <li key={miss.path}>
+                      <code>{miss.path}</code>
+                      {!miss.eligible && " · outside the candidate inventory"}
+                    </li>
+                  ))}
+                </ul>
+              </details>
+            )}
           </div>
         )}
         {!calls.length && (

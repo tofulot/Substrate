@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import type {
   AgentEvent,
+  ApprovalMode,
   Config,
   Message,
   Project,
@@ -22,9 +23,10 @@ interface State {
   terminalOutput: string;
   init(): Promise<void>;
   openProject(): Promise<void>;
+  createProject(name: string): Promise<void>;
   selectSession(id: string): Promise<void>;
   newSession(): Promise<void>;
-  send(task: string): Promise<void>;
+  send(task: string, approvalMode: ApprovalMode): Promise<void>;
   event(event: AgentEvent): void;
   refreshSessions(): Promise<void>;
   setError(error: unknown): void;
@@ -67,23 +69,12 @@ export const useStore = create<State>((set, get) => ({
   },
   openProject: async () => {
     try {
-      if (get().running)
-        throw new Error("Stop the current task before switching workspaces.");
-      const project = await api.openProject();
-      if (!project) return;
-      set({
-        project,
-        error: null,
-        terminalOutput: "",
-        revision: get().revision + 1,
-      });
-      const existing = get().sessions.find((s) => s.project === project.path);
-      if (existing) await get().selectSession(existing.id);
-      else await get().newSession();
+      await switchProject(() => api.openProject());
     } catch (error) {
       get().setError(error);
     }
   },
+  createProject: (name) => switchProject(() => api.createProject(name)),
   selectSession: async (id) => {
     try {
       if (get().running && get().running !== id)
@@ -131,7 +122,7 @@ export const useStore = create<State>((set, get) => ({
       get().setError(error);
     }
   },
-  send: async (task) => {
+  send: async (task, approvalMode) => {
     const { session, running, config } = get();
     if (running || !task.trim()) return;
     if (!config?.has_key) {
@@ -155,7 +146,11 @@ export const useStore = create<State>((set, get) => ({
       },
     });
     try {
-      await api.rpc("agent.start", { session_id: session.id, task });
+      await api.rpc("agent.start", {
+        session_id: session.id,
+        task,
+        approval_mode: approvalMode,
+      });
     } catch (error) {
       set({ running: null, session });
       get().setError(error);
@@ -237,3 +232,20 @@ export const useStore = create<State>((set, get) => ({
     }
   },
 }));
+
+async function switchProject(load: () => Promise<Project | null>) {
+  if (useStore.getState().running)
+    throw new Error("Stop the current task before switching workspaces.");
+  const project = await load();
+  if (!project) return;
+  const { sessions, revision, selectSession, newSession } = useStore.getState();
+  useStore.setState({
+    project,
+    error: null,
+    terminalOutput: "",
+    revision: revision + 1,
+  });
+  const existing = sessions.find((s) => s.project === project.path);
+  if (existing) await selectSession(existing.id);
+  else await newSession();
+}

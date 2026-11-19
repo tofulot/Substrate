@@ -3,6 +3,8 @@ export interface Project {
   name: string;
   branch: string | null;
 }
+export type ApprovalMode = "ask" | "approve_edits";
+
 export interface ToolActivity {
   id: string;
   name: string;
@@ -57,6 +59,7 @@ export interface DesktopAPI {
     params?: Record<string, unknown>,
   ): Promise<T>;
   openProject(): Promise<Project | null>;
+  createProject(name: string): Promise<Project>;
   setApiKey(key: string): Promise<void>;
   onEvent(callback: (event: AgentEvent) => void): () => void;
   platform: string;
@@ -159,6 +162,11 @@ export interface RunTrace {
   tool_calls: number;
   tool_ms: number;
   approval_wait_ms: number;
+  context_reads?: {
+    successful: number;
+    missed: number;
+    missed_paths: { path: string; snapshot_id: string; eligible: boolean }[];
+  };
 }
 export interface UsageReport {
   calls: CallTrace[];

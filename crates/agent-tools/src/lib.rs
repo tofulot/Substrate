@@ -8,10 +8,12 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
-    process::Command,
+    process::{Child, Command},
     sync::mpsc,
 };
 use tokio_util::sync::CancellationToken;
+mod npm;
+pub use npm::{npm_start_script, verify_npm_app};
 pub const MAX_FILE: u64 = 512 * 1024;
 pub fn workspace(path: &str) -> Result<PathBuf> {
     let root = std::fs::canonicalize(path)?;
@@ -209,6 +211,31 @@ pub async fn command(
         c.args(["-c", script]);
         c
     };
+    let (mut child, group, stdout, stderr) = spawn_command(root, &mut cmd, output)?;
+    let exit = tokio::select! {
+        _=cancel.cancelled()=>Err(anyhow::anyhow!("Command cancelled")),
+        result=tokio::time::timeout(Duration::from_secs(120),child.wait())=>match result {
+            Ok(status)=>Ok(status?),
+            Err(_)=>Err(anyhow::anyhow!("Command timed out after 120 seconds")),
+        }
+    };
+    // A daemon may retain the pipes after its parent exits.
+    drop(group);
+    if exit.is_err() {
+        let _ = child.kill().await;
+        stdout.abort();
+        stderr.abort();
+    }
+    Ok(json!({"exit_code":exit?.code(),"stdout":stdout.await??,"stderr":stderr.await??}))
+}
+
+type OutputReader = tokio::task::JoinHandle<Result<String>>;
+
+fn spawn_command(
+    root: &Path,
+    cmd: &mut Command,
+    output: mpsc::Sender<String>,
+) -> Result<(Child, ProcessGroup, OutputReader, OutputReader)> {
     cmd.current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -221,18 +248,12 @@ pub async fn command(
     #[cfg(unix)]
     cmd.process_group(0);
     let mut child = cmd.spawn()?;
-    let _group = ProcessGroup(child.id());
+    let group = ProcessGroup(child.id());
     let out = child.stdout.take().context("No stdout")?;
     let err = child.stderr.take().context("No stderr")?;
     let a = tokio::spawn(drain(out, output.clone()));
     let b = tokio::spawn(drain(err, output));
-    let status = tokio::select! {
-        _=cancel.cancelled()=>{let _=child.kill().await; a.abort(); b.abort(); bail!("Command cancelled");},
-        result=tokio::time::timeout(Duration::from_secs(120),child.wait())=>match result {Ok(s)=>s?,Err(_)=>{let _=child.kill().await; a.abort(); b.abort(); bail!("Command timed out after 120 seconds");}}
-    };
-    // A daemon may retain the pipes after its parent exits. Kill group before joining readers.
-    drop(_group);
-    Ok(json!({"exit_code":status.code(),"stdout":a.await??,"stderr":b.await??}))
+    Ok((child, group, a, b))
 }
 pub async fn git(root: &Path, args: &[&str]) -> Result<String> {
     let result = tokio::time::timeout(
@@ -302,13 +323,18 @@ pub fn definitions() -> Vec<Value> {
         ),
         (
             "apply_patch",
-            "Propose one exact replacement or a new file. Requires approval before writing.",
+            "Make one exact replacement or create a new file. Approval follows the current mode.",
             json!({"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}}),
         ),
         (
             "execute_command",
             "Run a shell command in the workspace on the host. Requires approval. 120 second timeout.",
             json!({"command":{"type":"string"}}),
+        ),
+        (
+            "verify_npm_app",
+            "Verify a new root npm app with a start script. First install its dependencies using an approved npm install if needed. This tool checks installed direct dependency versions against the registry and runs npm start. Electron apps must open a renderer page. Requests approval and stops only the launch it owns.",
+            json!({}),
         ),
         (
             "git_diff",
@@ -359,6 +385,7 @@ pub async fn execute(
             .await?
         )),
         "execute_command" => command(root, string(args, "command")?, cancel, output).await,
+        "verify_npm_app" => verify_npm_app(root, cancel, output).await,
         "search_repository" => {
             let result = tokio::time::timeout(
                 Duration::from_secs(15),

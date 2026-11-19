@@ -199,7 +199,20 @@ impl Server {
                     !c.key.is_empty(),
                     "Add your Subquadratic API key in Settings"
                 );
+                let use_snap = match p.get("context_selection") {
+                    None => true,
+                    Some(mode) if mode == "snap" => true,
+                    Some(mode) if mode == "local" => false,
+                    _ => anyhow::bail!("context_selection must be local or snap"),
+                };
                 let config = agent_core::RunConfig {
+                    use_snap,
+                    approval_mode: p
+                        .get("approval_mode")
+                        .cloned()
+                        .map(serde_json::from_value)
+                        .transpose()?
+                        .unwrap_or_default(),
                     key: c.key.clone(),
                     model: c.model.clone(),
                     max_steps: c.max_steps,

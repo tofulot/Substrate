@@ -16,7 +16,7 @@ The transport is UTF-8, newline-delimited JSON-RPC 2.0 over stdin/stdout. Each r
 | `session.create` | `project` | new session |
 | `session.list` | none | recent session metadata |
 | `session.resume` | `session_id` | persisted messages, tool activities, and running state |
-| `agent.start` | `session_id`, `task` | immediate acknowledgment; asynchronous events follow |
+| `agent.start` | `session_id`, `task`, optional `approval_mode` (`ask` by default, or `approve_edits`) | immediate acknowledgment; asynchronous events follow |
 | `agent.interrupt`, `session.cancel` | `session_id` | cancellation acknowledgment |
 | `tool.approve`, `tool.reject` | `session_id`, `tool_id` | approval acknowledgment |
 | `models.list` | none | model objects available to the current key |
@@ -55,6 +55,10 @@ Notifications have no `id`. Each agent/tool notification includes `params.sessio
 
 Tools have `approval`, `running`, `completed`, `failed`, or `rejected` status. Approval IDs are scoped to their session and consumed once. Registering an approval waiter precedes publishing its notification. Closing the app cancels jobs; pending approval cards are displayed as interrupted after restoration.
 
+On macOS and Linux, a run that adds a root `package.json` start script must pass `verify_npm_app` before a final answer can report completion. The tool requires command approval, checks installed direct dependencies against npm, and supervises `npm start`. For Electron it checks the installed major against the supported stable release lines and waits for a renderer page before stopping the test launch. A syntax check or an arbitrary shell command does not satisfy this requirement.
+
+The approval mode applies to one agent run. In `approve_edits`, validated `apply_patch` calls emit `tool.started` and `tool.completed` with the patch preview. Shell commands require approval in both modes.
+
 Parse/envelope failures use `-32700`; method/validation/runtime failures use `-32000`. Provider errors expose a sanitized status and remediation text, rather than echoing upstream response bodies or credentials.
 
 ## Context and trace semantics
@@ -68,3 +72,6 @@ Agent turns send up to 128 locally shortlisted, prefiltered files to Snap's `/v1
 Call traces include `kind` (`generation` or `context_selection`, defaulting to generation for old records). Selection traces use model `subq-snap-1.1`; `context_bytes` measures selector state, `history_bytes` is zero, and first-output/finish-reason metrics are unavailable for this non-streaming endpoint. After packing, a selection trace links to the resulting snapshot. Before packing or after interruption, `snapshot_id` can be empty and revision zero. Provider usage includes selection calls even when generation falls back. Raw decision responses and excerpts are not stored in traces.
 
 `CallTrace.metrics.usage` and each individual token field are nullable. Null means unknown; zero is a reported zero. Byte counts, duration, and estimates are also nullable when not observed (for example after a crash). `estimated_input_tokens` is the request-byte count divided by four, rounded up, and is never substituted for provider usage. Calls are persisted before inference and finalized after stream completion, error, or interruption. A successful stream's finish reason does not terminate reading before a possible usage trailer. Run timing separates recorded tool execution and approval waits; a recovered interrupted run may have partial timing. No token prices are assumed.
+
+
+`RunTrace.context_reads` counts successful `read_file` calls and those whose path was absent from the generation snapshot for that turn. `missed_paths` contains up to 64 unique paths with their first missed snapshot ID and whether they were in its eligible inventory. Successful reads of ineligible files are counted, but do not affect selection. The 16 most recently missed eligible paths take priority within the budget on subsequent turns of that run, after pinned repository guidance. The snapshot's optional `selection.promoted_paths` records eligible paths considered for promotion. Promotion reuses ranking scores and does not trigger a Snap request by itself.

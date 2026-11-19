@@ -3,6 +3,7 @@ import type { AgentEvent, DesktopAPI } from "../shared/types";
 const api: DesktopAPI = {
   rpc: (method, params) => ipcRenderer.invoke("agent:rpc", method, params),
   openProject: () => ipcRenderer.invoke("project:open"),
+  createProject: (name) => ipcRenderer.invoke("project:create", name),
   setApiKey: (key) => ipcRenderer.invoke("credentials:set", key),
   onEvent: (callback) => {
     const handler = (_event: Electron.IpcRendererEvent, message: AgentEvent) =>

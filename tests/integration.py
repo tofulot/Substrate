@@ -71,6 +71,23 @@ class Model(BaseHTTPRequestHandler):
             events = [{"choices": [{"delta": {"content": "Relevant source selected."}, "finish_reason": None}]}]
         elif task == 'provider_error':
             self.send_response(403); self.end_headers(); self.wfile.write(b'do-not-store-this-provider-body'); return
+        elif task == 'verify_new_npm_app':
+            if not outputs:
+                events = call('apply_patch', {
+                    'path': 'package.json', 'old_text': '',
+                    'new_text': json.dumps({'name': 'startup-fixture', 'scripts': {'start': 'node -e "setInterval(() => {}, 1000)"'}}),
+                })
+            elif len(outputs) == 1:
+                generation_count = sum(any(m.get('content') == task for m in r['messages']) for r in requests)
+                if generation_count == 2:
+                    events = [{"choices": [{"delta": {"content": "Prematurely done."}, "finish_reason": None}]}]
+                else:
+                    assert 'Prematurely done.' not in json.dumps(messages)
+                    assert 'no successful dependency and startup verification' in messages[0]['content']
+                    events = call('verify_npm_app', {})
+            else:
+                assert json.loads(outputs[-1]['content'])['verified'] is True
+                events = [{"choices": [{"delta": {"content": "App launch verified."}, "finish_reason": None}]}]
         elif task == 'stale':
             if outputs:
                 assert 'changed since' in json.loads(outputs[-1]['content'])['error']
@@ -86,6 +103,15 @@ class Model(BaseHTTPRequestHandler):
             events = []
         elif task == 'cancel':
             events = call('execute_command', {'command': 'sleep 60 & child=$!; echo "$child"; wait "$child"'})
+        elif task == 'approve_edits':
+            if not outputs:
+                events = call('apply_patch', {'path': 'automatic.txt', 'old_text': '', 'new_text': 'auto applied'})
+            elif len(outputs) == 1:
+                assert json.loads(outputs[-1]['content'])['applied']
+                events = call('execute_command', {'command': 'touch command-ran.txt'})
+            else:
+                assert json.loads(outputs[-1]['content'])['rejected']
+                events = [{"choices": [{"delta": {"content": "Applied the patch."}, "finish_reason": None}]}]
         elif task == 'reject':
             if messages[-1]['role'] == 'tool':
                 assert json.loads(messages[-1]['content'])['rejected']
@@ -123,8 +149,8 @@ class Model(BaseHTTPRequestHandler):
             pass
 
 class Client:
-    def __init__(self, directory, url):
-        env = dict(os.environ, SUBSTRATE_DB=str(directory / 'data' / 'test.db'), SUBQ_API_KEY='fixture-key', SUBSTRATE_API_BASE=url)
+    def __init__(self, directory, url, key="fixture-key"):
+        env = dict(os.environ, SUBSTRATE_DB=str(directory / 'data' / 'test.db'), SUBQ_API_KEY=key, SUBSTRATE_API_BASE=url)
         self.process = subprocess.Popen([str(ROOT / 'target/debug/agent-server')], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
         self.messages = queue.Queue()
         self.events = []
@@ -153,13 +179,23 @@ class Client:
         raise AssertionError('RPC timeout')
 
     def wait(self, method, predicate=lambda params: True):
+        return self.wait_event({method}, predicate)['params']
+
+    def wait_event(self, methods, predicate=lambda params: True, timeout=10):
+        def matches(event):
+            return event.get('method') in methods and predicate(event.get('params', {}))
+
         for i, event in enumerate(self.events):
-            if event.get('method') == method and predicate(event.get('params', {})):
-                return self.events.pop(i)['params']
+            if matches(event):
+                return self.events.pop(i)
+        deadline = time.monotonic() + timeout
         while True:
-            message = self.messages.get(timeout=10)
-            if message.get('method') == method and predicate(message.get('params', {})):
-                return message['params']
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f'Timed out waiting for {sorted(methods)}')
+            message = self.messages.get(timeout=remaining)
+            if matches(message):
+                return message
             self.events.append(message)
 
     def close(self):
@@ -238,9 +274,21 @@ def main():
         client.rpc('tool.reject', session_id=denied, tool_id=approval['id'])
         client.wait('agent.completed')
         assert not (repo / 'denied.txt').exists()
+        automatic = client.rpc('session.create', project=str(repo))['id']
+        client.rpc('agent.start', session_id=automatic, task='approve_edits', approval_mode='approve_edits')
+        approval = client.wait('tool.approval.required', lambda p: p.get('session_id') == automatic)['tool']
+        assert approval['name'] == 'execute_command'
+        assert (repo / 'automatic.txt').read_text() == 'auto applied'
+        assert not (repo / 'command-ran.txt').exists()
+        client.rpc('tool.reject', session_id=automatic, tool_id=approval['id'])
+        client.wait('agent.completed', lambda p: p.get('session_id') == automatic)
+        assert not (repo / 'command-ran.txt').exists()
+        automatic_messages = client.rpc('session.resume', session_id=automatic)['messages']
+        patch = next(m['tool'] for m in automatic_messages if m.get('tool', {}).get('name') == 'apply_patch')
+        assert patch['status'] == 'completed' and patch['preview']['after'] == 'auto applied'
         # An external edit that preserves old_text must still invalidate the model's proposal.
         stale = client.rpc('session.create', project=str(repo))['id']
-        client.rpc('agent.start', session_id=stale, task='stale')
+        client.rpc('agent.start', session_id=stale, task='stale', approval_mode='approve_edits')
         client.wait('agent.message.delta', lambda p: p.get('session_id') == stale)
         (repo / 'hello.txt').write_text('hello substrate\nexternal')
         stale_ready.set()
@@ -341,6 +389,19 @@ def main():
         selection_trace = client.rpc('usage.get', session_id=interrupted_selection)['calls'][0]
         assert selection_trace['kind'] == 'context_selection' and selection_trace['status'] == 'interrupted'
         assert selection_trace['metrics']['usage'] is None
+        if os.name == 'posix':
+            app_dir = directory / 'npm-app'
+            app_dir.mkdir()
+            app_session = client.rpc('session.create', project=str(app_dir))['id']
+            for_app = lambda params: params.get('session_id') == app_session
+            client.rpc('agent.start', session_id=app_session, task='verify_new_npm_app', approval_mode='approve_edits')
+            approval = client.wait('tool.approval.required', for_app)['tool']
+            assert approval['name'] == 'verify_npm_app'
+            client.rpc('tool.approve', session_id=app_session, tool_id=approval['id'])
+            client.wait('agent.completed', for_app)
+            messages = client.rpc('session.resume', session_id=app_session)['messages']
+            assert messages[-1]['content'] == 'App launch verified.'
+            assert not any('Prematurely done.' in json.dumps(e) for e in client.events)
         client.close()
         client = Client(directory, url)
         restored = client.rpc('session.resume', session_id=session)

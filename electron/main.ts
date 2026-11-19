@@ -6,10 +6,16 @@ import {
   Menu,
   safeStorage,
 } from "electron";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { join, dirname } from "node:path";
+import {
+  execFile,
+  spawn,
+  type ChildProcessWithoutNullStreams,
+} from "node:child_process";
+import { delimiter, join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promises as fs } from "node:fs";
+import { backup, DatabaseSync } from "node:sqlite";
+import { promisify } from "node:util";
 import type { AgentEvent } from "../shared/types";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -87,19 +93,109 @@ function offline(message: string) {
     params: { message },
   } satisfies AgentEvent);
 }
+async function agentPath(): Promise<string | undefined> {
+  const inherited = process.env.PATH;
+  if (process.platform !== "darwin") return inherited;
+
+  // Finder launches apps with a minimal PATH. Read macOS's configured paths
+  // without evaluating the helper's shell output or sourcing startup scripts.
+  let configured = "";
+  try {
+    const { stdout } = await promisify(execFile)(
+      "/usr/libexec/path_helper",
+      ["-s"],
+      { env: { PATH: "" }, timeout: 1_000 },
+    );
+    configured = stdout.match(/^PATH="([^"\n]*)";/u)?.[1] ?? "";
+  } catch {
+    // Keep the inherited PATH and the standard package-manager directories.
+  }
+  const paths = [
+    ...(inherited ?? "").split(delimiter),
+    ...configured.split(delimiter),
+    "/usr/local/bin",
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+  ];
+  return [...new Set(paths.filter(Boolean))].join(delimiter);
+}
+
+function storagePath(folder: "Data" | "Projects") {
+  return join(app.getPath("documents"), "Substrate", folder);
+}
+
+async function pathExists(path: string) {
+  try {
+    await fs.stat(path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    return false;
+  }
+}
+
+async function prepareStorage() {
+  const data = storagePath("Data");
+  await Promise.all([
+    fs.mkdir(data, { recursive: true, mode: 0o700 }),
+    fs.mkdir(storagePath("Projects"), { recursive: true }),
+  ]);
+
+  const db = join(data, "sessions.db");
+  if (process.env.SUBSTRATE_DB !== undefined) return process.env.SUBSTRATE_DB;
+  if (await pathExists(db)) return db;
+  const legacy = app.getPath("userData");
+  const legacyDb = join(legacy, "sessions.db");
+  const legacyConfig = join(legacy, "config.json");
+  const [hasDb, hasConfig] = await Promise.all([
+    pathExists(legacyDb),
+    pathExists(legacyConfig),
+  ]);
+  if (!hasDb && !hasConfig) return db;
+
+  // Publish complete files without overwriting data from another launch.
+  const staging = await fs.mkdtemp(join(data, ".migration-"));
+  async function publish(file: string) {
+    try {
+      await fs.link(join(staging, file), join(data, file));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+  }
+  try {
+    if (hasConfig && !(await pathExists(join(data, "config.json")))) {
+      await fs.copyFile(legacyConfig, join(staging, "config.json"));
+      await publish("config.json");
+    }
+    if (hasDb) {
+      // SQLite's online backup includes committed changes in the WAL.
+      const source = new DatabaseSync(legacyDb, { readOnly: true });
+      try {
+        await backup(source, join(staging, "sessions.db"));
+      } finally {
+        source.close();
+      }
+      await publish("sessions.db");
+    }
+  } finally {
+    await fs.rm(staging, { recursive: true, force: true });
+  }
+  return db;
+}
+
 async function startAgent() {
+  const db = await prepareStorage();
   const binary = app.isPackaged
     ? join(process.resourcesPath, "agent-server")
     : join(app.getAppPath(), "target/debug/agent-server");
   agent = spawn(binary, [], {
     env: {
       ...process.env,
+      PATH: await agentPath(),
       SUBSTRATE_RG: app.isPackaged
         ? join(process.resourcesPath, "bin/rg")
         : process.env.SUBSTRATE_RG,
-      SUBSTRATE_DB:
-        process.env.SUBSTRATE_DB ??
-        join(app.getPath("userData"), "sessions.db"),
+      SUBSTRATE_DB: db,
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -149,7 +245,7 @@ async function startAgent() {
       join(app.getPath("userData"), "subq-key.enc"),
     );
     if (await safeStorage.isAsyncEncryptionAvailable()) {
-      const key = await safeStorage.decryptStringAsync(encrypted);
+      const { result: key } = await safeStorage.decryptStringAsync(encrypted);
       await rpc("config.credentials", { key });
     }
   } catch (error) {
@@ -185,10 +281,33 @@ ipcMain.handle("project:open", async (event) => {
   const result = await dialog.showOpenDialog(window!, {
     title: "Open a workspace",
     buttonLabel: "Open workspace",
-    properties: ["openDirectory"],
+    defaultPath: storagePath("Projects"),
+    properties: ["openDirectory", "createDirectory"],
   });
   if (result.canceled || !result.filePaths[0]) return null;
   return rpc("project.open", { path: result.filePaths[0] });
+});
+ipcMain.handle("project:create", async (event, input: unknown) => {
+  validateSender(event);
+  const name = typeof input === "string" ? input.trim() : "";
+  if (!name || name === "." || name === ".." || /[\\/:\u0000-\u001f]/u.test(name))
+    throw new Error(
+      "Enter a folder name without slashes, colons, or control characters.",
+    );
+  await ready;
+  const projects = storagePath("Projects");
+  await fs.mkdir(projects, { recursive: true });
+  const path = join(projects, name);
+  try {
+    await fs.mkdir(path);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "EEXIST")
+      throw new Error("A file or folder with that name already exists.");
+    if (code === "ENAMETOOLONG") throw new Error("The folder name is too long.");
+    throw error;
+  }
+  return rpc("project.open", { path });
 });
 ipcMain.handle("credentials:set", async (event, key: unknown) => {
   validateSender(event);

@@ -12,7 +12,7 @@ npm run dev
 ```
 
 1. Open **Settings** (`⌘,`), enter your **Subquadratic API key**, and test the connection.
-2. Open a local repository (`⌘O`). Any local directory works; Git features require a Git repository.
+2. Open a local directory (`⌘O`) or choose **New folder** in the workspace sidebar. Git features require a Git repository.
 3. Describe a coding task and press Enter. Shift+Enter inserts a new line.
 4. Review proposed edits and commands, then approve or decline each action. Escape or the stop button interrupts the task.
 5. Open the right panel for files and Git diffs, and the terminal button for live command output.
@@ -20,6 +20,8 @@ npm run dev
 The default model is `subq-preview`, served directly by `https://api.subq.ai/v1/chat/completions`. **SubQ Preview requires organization early-access permission.** A valid key without this permission will receive HTTP 403. Settings checks `/v1/models` for access. `subq-snap-1.1` is a decision model, so it is deliberately excluded from the generative coding loop. There is no silent fallback to another provider.
 
 For development, `SUBQ_API_KEY` can supply a key to the harness instead of entering one in Settings. Never commit a key. The UI never receives saved credentials back from the backend.
+
+Substrate creates `~/Documents/Substrate` on first launch. **New folder** creates and opens a workspace under `Projects`. The app stores conversations, repository snapshots, usage traces, and model settings under `Data`. Existing desktop sessions and settings are copied there on upgrade. The encrypted API key stays in the OS application data directory.
 
 ## Build a Mac application
 
@@ -50,6 +52,19 @@ Rankings are tied to task and repository-inventory hashes and reused between unc
 Usage tracing records task and call IDs, model, context revision, request/response bytes, elapsed time, first output latency, requested tool counts, execution time, approval wait, completion status, and provider-reported token/cache/reasoning counts when returned. The streaming reader consumes trailing usage-only events after the finish signal. Missing fields remain **unknown**; reported zeroes remain zeroes. The request-bytes-divided-by-four estimate is explicitly a heuristic, not a tokenizer count or bill. There are no assumed prices or cache discounts. The Chat Completions integration does not assume undocumented support for requesting usage trailers; availability depends on what the provider returns.
 
 Traces contain metadata rather than prompts, credentials, raw provider errors, or source contents. Source blobs, manifests, conversation data, and traces stay in the local unencrypted database. Eligible excerpts are sent to Subquadratic for Snap selection, including some files that may not fit the final generation snapshot; selected source is sent to Preview. Snapshot bodies are not appended to the conversation history. Interrupted traces are recovered as interrupted with unavailable metrics left unknown. Insights totals both selection and generation in the latest 200 call records and displays details for the latest 30 calls/tasks/snapshots; historical data is retained in SQLite without automatic pruning.
+
+Insights counts successful agent file reads that were outside the snapshot for that turn. A missed file that was eligible for selection gets priority on later turns of the same task if it still passes the current filters and fits the budget. Failed reads do not count. The trace records counts and up to 64 distinct missed paths.
+
+Run the local-vs-Snap comparison with:
+
+```sh
+npm run eval:context
+npm run --silent eval:context -- --live --repeats 3 > context-report.json
+```
+
+The default scripted fixture exercises measurement, missed-file promotion, and patch approval. Use `--live` with `SUBQ_API_KEY` set to measure actual model behavior. Live runs use API credits and send synthetic source and tasks. The suite pairs local and Snap selection on three source lookups and two editing tasks, including a coordinated source and test edit. Each task runs against a 7-file fixture and a 519-file fixture at the same 32 KiB context budget. Each run starts with a fresh repository and session.
+
+The runner rejects shell commands and approves edits only to designated fixture files. Lookup answers must match the expected integer. Editing runs must produce the expected file contents without changes elsewhere. The JSON report records accuracy, file coverage, extra reads, generation context bytes and calls, Snap calls and timing, and actual selection strategy.
 
 ## Automatic GitHub releases
 
@@ -128,8 +143,8 @@ See [docs/protocol.md](docs/protocol.md) for methods and events. React has no No
 - Keys entered in Settings are encrypted using Electron `safeStorage` and OS-provided cryptography, saved with mode `0600`, decrypted only in the main process, and sent to Rust over its private stdin pipe. Linux plaintext credential backends are refused. API keys are not written to SQLite or returned through configuration RPC.
 - Model inference sends task history and tool results to Subquadratic. Requests use `store: false`; this does not mean inference happens locally. Conversations are saved locally by Substrate.
 - File tools reject absolute paths, parent traversal, Git internals, and symlinks that escape the selected workspace. Directory listings skip symlinks, `.git`, dependency folders, and build output. Read/edit size is capped at 512 KiB.
-- Every patch and shell command requires a separate approval. An edit preview shows exact before/after text. The write fails if the file has changed while awaiting approval. Patches use exact, unique text matches and an atomic rename.
-- **Approval and path validation are not an OS security sandbox.** Approved commands run with your user permissions and can access the host filesystem and network. Run only on repositories you trust, and read commands before approving. This release has no “approve everything” switch.
+- **Ask before acting** is the default composer mode and requests approval for each patch. Select **Approve all code edits** to apply patches automatically on tasks you start in that mode. Both modes show exact before/after diffs and use the same stale-file checks and atomic writes.
+- Shell commands always require a separate approval. Approved commands run with your user permissions and can access the host filesystem and network. Run only on repositories you trust, and read commands before approving.
 - Shell commands have a 120-second timeout, bounded captured output, closed stdin, and cancellation. Unix process groups are killed to clean up shell descendants. Provider credential environment variables are removed from tool subprocesses. On other platforms, process-tree isolation needs additional work.
 - The custom loop allows up to 20 model turns by default and one active agent per app. Multiple calls in a turn run sequentially. Invalid tool arguments and tool failures return recoverable model-visible errors. No command or edit is automatically retried.
 - The context budget is an explicit conservative **360 KB serialized-input limit**, not a claim about the model's maximum context or an exact token count. On reaching it, start a new conversation. History is never silently compacted or truncated.

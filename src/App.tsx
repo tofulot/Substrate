@@ -17,6 +17,7 @@ import {
   Files,
   Folder,
   FolderOpen,
+  FolderPlus,
   GitBranch,
   GitCompareArrows,
   Layers3,
@@ -36,6 +37,7 @@ import {
 } from "lucide-react";
 import Markdown from "react-markdown";
 import { version as appVersion } from "../package.json";
+import type { ApprovalMode } from "../shared/types";
 import { api, useStore } from "./lib/store";
 import { Button } from "./components/ui/button";
 import Settings from "./components/Settings";
@@ -64,6 +66,7 @@ const toolNames: Record<string, string> = {
   search_repository: "Search repository",
   apply_patch: "Edit file",
   execute_command: "Run command",
+  verify_npm_app: "Verify app launch",
   git_diff: "Inspect changes",
 };
 function ToolCard({
@@ -203,6 +206,85 @@ function FileTree({
     </div>
   );
 }
+function NewWorkspaceButton({ disabled }: { disabled: boolean }) {
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState("");
+  const [error, setError] = useState("");
+  const [creating, setCreating] = useState(false);
+
+  return (
+    <Dialog.Root
+      open={open}
+      onOpenChange={(next) => {
+        if (creating) return;
+        setOpen(next);
+        setName("");
+        setError("");
+      }}
+    >
+      <Dialog.Trigger className="new-workspace-button" disabled={disabled}>
+        <FolderPlus size={14} /> New folder
+      </Dialog.Trigger>
+      <Dialog.Portal>
+        <Dialog.Overlay className="modal-overlay" />
+        <Dialog.Content className="settings-modal">
+          <Dialog.Title>New workspace folder</Dialog.Title>
+          <Dialog.Description>
+            Create and open a workspace in Documents/Substrate/Projects.
+          </Dialog.Description>
+          <form
+            onSubmit={async (event) => {
+              event.preventDefault();
+              if (creating || !name.trim()) return;
+              setCreating(true);
+              setError("");
+              try {
+                await useStore.getState().createProject(name);
+                setOpen(false);
+              } catch (error) {
+                const message =
+                  error instanceof Error ? error.message : String(error);
+                setError(
+                  message.replace(
+                    /^Error invoking remote method 'project:create': Error: /u,
+                    "",
+                  ),
+                );
+              } finally {
+                setCreating(false);
+              }
+            }}
+          >
+            <label htmlFor="workspace-folder-name">Folder name</label>
+            <div className="key-field">
+              <input
+                id="workspace-folder-name"
+                value={name}
+                onChange={(event) => setName(event.target.value)}
+                readOnly={creating}
+                required
+              />
+            </div>
+            {error && (
+              <p className="form-error" role="alert">{error}</p>
+            )}
+            <div className="modal-actions">
+              <Dialog.Close asChild>
+                <Button variant="outline" type="button" disabled={creating}>
+                  Cancel
+                </Button>
+              </Dialog.Close>
+              <Button type="submit" disabled={creating || !name.trim()}>
+                {creating ? "Creating…" : "Create folder"}
+              </Button>
+            </div>
+          </form>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
+  );
+}
+
 export default function App() {
   const {
     project,
@@ -215,6 +297,7 @@ export default function App() {
     revision,
   } = useStore();
   const [draft, setDraft] = useState("");
+  const [approvalMode, setApprovalMode] = useState<ApprovalMode>("ask");
   const [sidebar, setSidebar] = useState(true);
   const [panel, setPanel] = useState(false);
   const [tab, setTab] = useState<"files" | "changes" | "insights">("files");
@@ -375,7 +458,7 @@ export default function App() {
     const task = draft.trim();
     setDraft("");
     stick.current = true;
-    void useStore.getState().send(task);
+    void useStore.getState().send(task, approvalMode);
   }
   const projectGroups = [...new Set(sessions.map((s) => s.project))];
   const visibleSessions = sessions.filter(
@@ -435,18 +518,12 @@ export default function App() {
         )}
         <div className="sidebar-section-label">
           WORKSPACE
-          <button
-            className="icon-button"
-            onClick={() => void useStore.getState().openProject()}
-            title="Open workspace (⌘O)"
-            aria-label="Open workspace"
-          >
-            <Plus size={14} />
-          </button>
+          <NewWorkspaceButton disabled={!connected || !!running} />
         </div>
         <button
           className={`workspace-card ${project ? "selected" : ""}`}
           onClick={() => void useStore.getState().openProject()}
+          title="Open workspace (⌘O)"
         >
           <span className="workspace-icon">
             <FolderOpen size={18} />
@@ -454,7 +531,7 @@ export default function App() {
           <span>
             <strong>{project?.name || "Open a workspace"}</strong>
             <small>
-              {project ? "Local repository" : "Bring your code along"}
+              {project ? "Local folder" : "Bring your code along"}
             </small>
           </span>
           <ChevronDown size={13} />
@@ -774,10 +851,23 @@ export default function App() {
                     <ChevronDown size={12} />
                   </button>
                   <span className="composer-separator" />
-                  <span className="approval-mode">
-                    <ShieldCheck size={13} />
-                    <span>Ask before acting</span>
-                  </span>
+                  <label className="approval-mode">
+                    <ShieldCheck size={13} aria-hidden="true" />
+                    <select
+                      aria-label="Approval mode"
+                      title="Shell commands always require approval"
+                      value={approvalMode}
+                      disabled={!!running}
+                      onChange={(event) =>
+                        setApprovalMode(event.target.value as ApprovalMode)
+                      }
+                    >
+                      <option value="ask">Ask before acting</option>
+                      <option value="approve_edits">
+                        Approve all code edits
+                      </option>
+                    </select>
+                  </label>
                 </div>
                 {running ? (
                   <button

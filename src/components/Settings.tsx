@@ -158,9 +158,9 @@ export default function Settings() {
           <div className="permission-note">
             <strong>You're in control</strong>
             <p>
-              Every edit and shell command asks for approval. Commands run on
-              your Mac with your user permissions; this version does not provide
-              an OS sandbox.
+              Use the composer to choose whether edits ask for approval. Shell
+              commands always ask for approval and run on your Mac with your
+              user permissions.
             </p>
           </div>
           {error && (

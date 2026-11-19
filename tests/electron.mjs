@@ -1,11 +1,15 @@
 import { _electron as electron, expect } from '@playwright/test'
-import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, writeFile, readFile, realpath, stat, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { resolve, join } from 'node:path'
 import { createServer } from 'node:http'
+import { randomUUID } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 const root = resolve(import.meta.dirname, '..')
 const temp = await mkdtemp(join(tmpdir(), 'substrate-desktop-test-'))
+const projects = join(temp, 'Documents', 'Substrate', 'Projects')
+const data = join(temp, 'Documents', 'Substrate', 'Data')
+const profile = join(temp, 'user')
 const repo = join(temp, 'workspace')
 await mkdir(repo)
 await writeFile(join(repo, 'hello.ts'), 'export const hello = "world"\n')
@@ -16,8 +20,18 @@ await writeFile(join(repo, '.env'), 'PRIVATE_TEST_SECRET=hidden')
 await writeFile(join(repo, '.gitignore'), '.env\n')
 let round = 0
 let snapCalls = 0
+const mac = process.platform === 'darwin'
+const commandCheck = (mac ? 'command -v mount >/dev/null && ' : '') + 'echo "Desktop integration verified"'
+const devRg = mac && !process.env.SUBSTRATE_TEST_EXECUTABLE
+  ? process.env.SUBSTRATE_RG ?? execFileSync('which', ['rg'], { encoding: 'utf8' }).trim()
+  : undefined
+const fixtureKey = `fixture-${randomUUID()}`
 const server = createServer(async (req, res) => {
   let body = ''; for await (const chunk of req) body += chunk
+  if (req.headers.authorization !== `Bearer ${fixtureKey}`) {
+    res.writeHead(401).end()
+    return
+  }
   if (req.url === '/v1/models') { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ data: [{ id: 'subq-preview' }, { id: 'subq-snap-1.1' }] })); return }
   const data = JSON.parse(body)
   if (req.url === '/v1/systemone') {
@@ -36,19 +50,26 @@ const server = createServer(async (req, res) => {
   const source = context.split('\n').filter(line => line.startsWith('{')).map(line => JSON.parse(line)).find(file => file.path === 'hello.ts')
   expect(source.content).toContain(round >= 3 ? '"substrate"' : '"world"')
   if (round === 1) expect(data.messages.at(-1).content).toContain('hello.ts')
+  if (round === 4) expect(JSON.parse(data.messages.at(-1).content)).toMatchObject({ exit_code: 0, stdout: 'Desktop integration verified\n' })
   const rounds = [
     ['search_repository', { query: 'export const' }],
     ['read_file', { path: 'hello.ts' }],
     ['apply_patch', { path: 'hello.ts', old_text: '"world"', new_text: '"substrate"' }],
-    ['execute_command', { command: 'echo "Desktop integration verified"' }]
+    ['execute_command', { command: commandCheck }],
+    null,
+    ['apply_patch', { path: 'automatic.ts', old_text: '', new_text: 'export const applied = true\n' }],
+    ['execute_command', { command: 'echo "Automatic edit verified"' }]
   ]
   res.writeHead(200, { 'Content-Type': 'text/event-stream' })
-  if (round < rounds.length) {
+  if (rounds[round]) {
     const [name, args] = rounds[round]
     res.write(`data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: `call-${round}`, function: { name, arguments: JSON.stringify(args) } }] }, finish_reason: null }] })}\n\n`)
     res.write(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'tool_calls' }] })}\n\n`)
   } else {
-    for (const content of ['Updated ', '`hello.ts`', ' and verified the command.']) {
+    const deltas = round === 4
+      ? ['Updated ', '`hello.ts`', ' and verified the command.']
+      : ['Applied the code edit.']
+    for (const content of deltas) {
       res.write(`data: ${JSON.stringify({ choices: [{ delta: { content }, finish_reason: null }] })}\n\n`)
       await new Promise(r => setTimeout(r, 80))
     }
@@ -62,23 +83,52 @@ await new Promise(r => server.listen(0, '127.0.0.1', r))
 let app
 const errors = []
 try {
-  app = await electron.launch({ ...(process.env.SUBSTRATE_TEST_EXECUTABLE ? { executablePath: process.env.SUBSTRATE_TEST_EXECUTABLE } : {}), args: [...(process.env.SUBSTRATE_TEST_EXECUTABLE ? [] : [root]), `--user-data-dir=${join(temp, 'user')}`], env: { ...process.env, SUBSTRATE_DB: join(temp, 'sessions.db'), SUBQ_API_KEY: 'fixture-key', SUBSTRATE_API_BASE: `http://127.0.0.1:${server.address().port}/v1`, ELECTRON_RENDERER_URL: '' } })
+  const launchOptions = { ...(process.env.SUBSTRATE_TEST_EXECUTABLE ? { executablePath: process.env.SUBSTRATE_TEST_EXECUTABLE } : {}), args: [...(process.env.SUBSTRATE_TEST_EXECUTABLE ? [] : [root]), `--user-data-dir=${profile}`], env: { ...process.env, ...(mac ? { PATH: '/usr/bin:/bin', CFFIXED_USER_HOME: temp } : {}), ...(devRg ? { SUBSTRATE_RG: devRg } : {}), HOME: temp, SUBQ_API_KEY: '', SUBSTRATE_API_BASE: `http://127.0.0.1:${server.address().port}/v1`, ELECTRON_RENDERER_URL: '' } }
+  delete launchOptions.env.SUBSTRATE_DB
+  app = await electron.launch({ ...launchOptions, env: { ...launchOptions.env, SUBSTRATE_DB: join(profile, 'sessions.db') } })
+  const setupPage = await app.firstWindow()
+  await setupPage.getByRole('button', { name: /^Settings/ }).click()
+  await setupPage.getByLabel(/^API key/).fill(fixtureKey)
+  await setupPage.getByLabel('Repository context budget').selectOption('1048576')
+  await setupPage.getByRole('button', { name: 'Save settings' }).click()
+  await expect.poll(() => setupPage.evaluate(() => window.substrate.rpc('config.get'))).toMatchObject({
+    has_key: true,
+    context_budget_bytes: 1048576,
+  })
+  const encryptedKey = await readFile(join(profile, 'subq-key.enc'))
+  expect(encryptedKey.includes(fixtureKey)).toBe(false)
+  const legacySession = await setupPage.evaluate(project => window.substrate.rpc('session.create', { project }), repo)
+  await app.close()
+
+  app = await electron.launch(launchOptions)
   const page = await app.firstWindow()
   page.on('pageerror', error => errors.push(error.message))
   await expect(page.getByText('Harness ready', { exact: true })).toBeVisible()
+  expect((await stat(join(data, 'sessions.db'))).isFile()).toBe(true)
+  expect((await stat(projects)).isDirectory()).toBe(true)
+  expect((await page.evaluate(() => window.substrate.rpc('session.list'))).map(session => session.id)).toContain(legacySession.id)
+  const approvalMode = page.getByRole('combobox', { name: 'Approval mode' })
+  await expect(approvalMode).toHaveValue('ask')
   await expect(page.getByRole('heading', { name: 'What are we building today?' })).toBeVisible()
   await mkdir(join(root, 'test-results'), { recursive: true })
   await page.screenshot({ animations: 'disabled', path: join(root, 'test-results/welcome.png') })
   // Replace only the native file-picker with a deterministic selection; everything
   // else uses the real preload, Electron IPC, Rust binary and SQLite database.
-  await app.evaluate(({ dialog }, repo) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [repo] }) }, repo)
+  await app.evaluate(({ dialog }, { repo, projects }) => {
+    dialog.showOpenDialog = async (_window, options) => {
+      if (options.defaultPath !== projects) throw new Error('Unexpected workspace picker default')
+      return { canceled: false, filePaths: [repo] }
+    }
+  }, { repo, projects })
   await page.getByRole('button', { name: 'Start by opening a workspace' }).click()
   await expect(page.getByText('workspace', { exact: true }).first()).toBeVisible()
   // Project selection renders before the Rust session and its first snapshot finish.
   await page.waitForFunction(() => Boolean(localStorage.getItem('substrate.session')))
   const baseline = await page.evaluate(async () => (await window.substrate.rpc('context.get', { session_id: localStorage.getItem('substrate.session') })).snapshot)
   await page.getByRole('button', { name: /^Settings/ }).click()
-  await expect(page.getByLabel('Repository context budget')).toHaveValue('524288')
+  await expect(page.getByLabel(/^API key/)).toHaveValue('')
+  await expect(page.getByText('A key is securely stored', { exact: true })).toBeVisible()
+  await expect(page.getByLabel('Repository context budget')).toHaveValue('1048576')
   await page.getByRole('button', { name: 'Test connection' }).click()
   await expect(page.getByText('Connected · subq-preview is available')).toBeVisible()
   await page.getByRole('button', { name: 'Close settings' }).click()
@@ -99,7 +149,7 @@ try {
   await page.getByRole('button', { name: 'Review', exact: true }).click()
   await page.getByRole('button', { name: 'Approve edit' }).click()
   await page.getByRole('button', { name: 'Review', exact: true }).click()
-  await expect(page.getByText('echo "Desktop integration verified"', { exact: true })).toBeVisible()
+  await expect(page.getByText(commandCheck, { exact: true })).toBeVisible()
   await page.getByRole('button', { name: 'Approve command' }).click()
   await expect(page.getByText('All systems quiet')).toBeVisible({ timeout: 15000 })
   expect(await readFile(join(repo, 'hello.ts'), 'utf8')).toContain('"substrate"')
@@ -141,11 +191,48 @@ try {
   await expect(page.getByText('Snapshot v4', { exact: true })).toBeVisible()
   await expect(page.getByText('8,089', { exact: true })).toBeVisible()
   // Renderer has no Node primitives, no raw IPC and no credential retrieval.
-  expect(await page.evaluate(() => ({ node: typeof window.require, process: typeof window.process, exposed: Object.keys(window.substrate).sort() }))).toEqual({ node: 'undefined', process: 'undefined', exposed: ['onEvent','openProject','platform','rpc','setApiKey'] })
+  expect(await page.evaluate(() => ({ node: typeof window.require, process: typeof window.process, exposed: Object.keys(window.substrate).sort() }))).toEqual({ node: 'undefined', process: 'undefined', exposed: ['createProject','onEvent','openProject','platform','rpc','setApiKey'] })
   const secretError = await page.evaluate(async () => { try { await window.substrate.rpc('config.credentials', { key: 'bad' }); return '' } catch (e) { return e.message } })
   expect(secretError).toContain('Unsupported operation')
+  await approvalMode.selectOption({ label: 'Approve all code edits' })
+  await page.getByRole('textbox', { name: 'Message Substrate' }).fill('Apply a code edit automatically')
+  await page.getByRole('button', { name: 'Send message' }).click()
+  await expect(approvalMode).toBeDisabled()
+  await page.getByRole('button', { name: 'Review', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'Approve command' })).toBeVisible()
+  expect(await readFile(join(repo, 'automatic.ts'), 'utf8')).toBe('export const applied = true\n')
+  await page.getByRole('button', { name: 'Approve command' }).click()
+  await expect(page.locator('.message-assistant').last()).toContainText('Applied the code edit.')
+  await expect(approvalMode).toBeEnabled()
+  const newFolder = page.getByRole('button', { name: 'New folder' })
+  const folderDialog = page.getByRole('dialog', { name: 'New workspace folder' })
+  const folderName = folderDialog.getByLabel('Folder name')
+  const createFolder = folderDialog.getByRole('button', { name: 'Create folder' })
+  await newFolder.click()
+  await folderName.fill('../outside')
+  await createFolder.click()
+  await expect(folderDialog.getByRole('alert')).toContainText('Enter a folder name')
+  await folderName.fill('A new project')
+  await createFolder.click()
+  await expect(folderDialog).toBeHidden()
+  const newProject = await realpath(join(projects, 'A new project'))
+  expect((await stat(newProject)).isDirectory()).toBe(true)
+  await expect(page.locator('.workspace-card')).toContainText('A new project')
+  const newSession = await page.evaluate(() => window.substrate.rpc('session.resume', { session_id: localStorage.getItem('substrate.session') }))
+  expect(newSession.project).toBe(newProject)
+  await newFolder.click()
+  await folderName.fill('A new project')
+  await createFolder.click()
+  await expect(folderDialog.getByRole('alert')).toContainText('already exists')
+  await folderDialog.getByRole('button', { name: 'Cancel' }).click()
   expect(errors).toEqual([])
-  console.log('PASS: Electron → preload → Rust → SubQ fixture; files, approvals, Monaco diff, terminal, persistence and renderer isolation')
+  await app.close()
+  app = await electron.launch(launchOptions)
+  const reopened = await app.firstWindow()
+  await expect(reopened.locator('.workspace-card')).toContainText('A new project')
+  const restoredSessionId = await reopened.evaluate(() => localStorage.getItem('substrate.session'))
+  expect(restoredSessionId).toBe(newSession.id)
+  console.log('PASS: Electron → preload → Rust → SubQ fixture; folder creation, migration, files, approvals, Monaco diff, terminal, persistence and renderer isolation')
 } finally {
   await app?.close()
   await new Promise(r => server.close(r))

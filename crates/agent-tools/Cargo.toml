@@ -11,4 +11,6 @@ tokio.workspace = true
 tokio-util.workspace = true
 uuid.workspace = true
 libc.workspace = true
+reqwest.workspace = true
+tempfile = "3"
 agent-protocol = { path = "../agent-protocol" }
