@@ -83,7 +83,13 @@ await new Promise(r => server.listen(0, '127.0.0.1', r))
 let app
 const errors = []
 try {
-  const launchOptions = { ...(process.env.SUBSTRATE_TEST_EXECUTABLE ? { executablePath: process.env.SUBSTRATE_TEST_EXECUTABLE } : {}), args: [...(process.env.SUBSTRATE_TEST_EXECUTABLE ? [] : [root]), `--user-data-dir=${profile}`], env: { ...process.env, ...(mac ? { PATH: '/usr/bin:/bin', CFFIXED_USER_HOME: temp } : {}), ...(devRg ? { SUBSTRATE_RG: devRg } : {}), HOME: temp, SUBQ_API_KEY: '', SUBSTRATE_API_BASE: `http://127.0.0.1:${server.address().port}/v1`, ELECTRON_RENDERER_URL: '' } }
+  const executablePath = process.env.SUBSTRATE_TEST_EXECUTABLE
+  // Exercise safeStorage without depending on the runner's login Keychain or its prompts.
+  const launchOptions = {
+    ...(executablePath ? { executablePath } : {}),
+    args: [...(executablePath ? [] : [root]), ...(mac ? ['--use-mock-keychain'] : []), `--user-data-dir=${profile}`],
+    env: { ...process.env, ...(mac ? { PATH: '/usr/bin:/bin', CFFIXED_USER_HOME: temp } : {}), ...(devRg ? { SUBSTRATE_RG: devRg } : {}), HOME: temp, SUBQ_API_KEY: '', SUBSTRATE_API_BASE: `http://127.0.0.1:${server.address().port}/v1`, ELECTRON_RENDERER_URL: '' },
+  }
   delete launchOptions.env.SUBSTRATE_DB
   app = await electron.launch({ ...launchOptions, env: { ...launchOptions.env, SUBSTRATE_DB: join(profile, 'sessions.db') } })
   const setupPage = await app.firstWindow()
