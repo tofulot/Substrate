@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent-context"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "agent-protocol",
  "anyhow",
@@ -17,7 +17,7 @@ dependencies = [
 
 [[package]]
 name = "agent-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "agent-context",
  "agent-models",
@@ -35,7 +35,7 @@ dependencies = [
 
 [[package]]
 name = "agent-models"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "agent-protocol",
  "anyhow",
@@ -49,7 +49,7 @@ dependencies = [
 
 [[package]]
 name = "agent-protocol"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "serde",
@@ -58,7 +58,7 @@ dependencies = [
 
 [[package]]
 name = "agent-runtime"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "agent-protocol",
  "anyhow",
@@ -70,7 +70,7 @@ dependencies = [
 
 [[package]]
 name = "agent-server"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "agent-context",
  "agent-core",
@@ -88,7 +88,7 @@ dependencies = [
 
 [[package]]
 name = "agent-storage"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "agent-protocol",
  "anyhow",
@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "agent-tools"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "agent-protocol",
  "anyhow",
