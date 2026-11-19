@@ -268,36 +268,72 @@ select:focus {
 .workspace-card > svg {
   color: #a0a68e;
 }
-.conversations-label {
-  font-size: 9px;
-}
-.conversations-label > span {
-  font-size: 10px;
-  letter-spacing: 0;
-}
 .conversation-list {
-  padding: 5px 10px;
+  padding: 4px 14px 12px;
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
+}
+.conversation-list ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.history-project + .history-project {
+  margin-top: 6px;
+}
+.history-project-toggle {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  min-height: 32px;
+  padding: 5px 7px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #5f6853;
+  text-align: left;
+  font-size: 12px;
+  font-weight: 550;
+}
+.history-project-toggle:hover,
+.history-project-toggle.active {
+  background: #e7eadf;
+  color: #404b31;
+}
+.history-project-toggle svg {
+  flex-shrink: 0;
+  color: #727e60;
+}
+.history-project-toggle span,
+.conversation-row span:not(.activity-dot) {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.conversation-list .history-chats {
+  margin: 2px 0 2px 12px;
+  padding-left: 7px;
+  border-left: 1px solid #daddd0;
+}
+.conversation-list button:focus-visible {
+  outline-offset: -2px;
 }
 .conversation-row {
   display: flex;
   align-items: center;
   gap: 10px;
   width: 100%;
-  padding: 10px 12px;
+  padding: 8px;
   border: 0;
   background: transparent;
   border-radius: 6px;
-  color: #818973;
+  color: #626c54;
   text-align: left;
   margin: 2px 0;
   font-size: 11px;
-}
-.conversation-row span:not(.activity-dot) {
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 .conversation-row svg {
   flex-shrink: 0;
@@ -310,17 +346,10 @@ select:focus {
   background: #e4e8d9;
 }
 .no-conversations {
-  color: #a6ad9a;
+  color: #626c54;
   text-align: center;
-  padding: 40px 5px;
-}
-.no-conversations svg {
-  opacity: 0.65;
-}
-.no-conversations p {
+  padding: 20px 5px;
   font-size: 11px;
-  line-height: 1.9;
-  margin-top: 9px;
 }
 .conversation-search {
   margin: -12px 15px 15px;
@@ -331,23 +360,9 @@ select:focus {
   padding: 8px 10px;
   font-size: 11px;
 }
-.other-workspaces {
-  padding-bottom: 20px;
-}
-.other-workspaces > button {
-  display: flex;
-  gap: 10px;
-  align-items: center;
-  width: 100%;
-  background: transparent;
-  border: 0;
-  padding: 9px 22px;
-  font-size: 11px;
-  color: #89917d;
-  text-align: left;
-}
 .sidebar-bottom {
   margin-top: auto;
+  flex-shrink: 0;
   padding: 10px 14px 0;
 }
 .local-note {

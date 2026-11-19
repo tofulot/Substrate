@@ -14,6 +14,10 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 mod npm;
 pub use npm::{npm_start_script, verify_npm_app};
+
+pub fn is_shell_tool(name: &str) -> bool {
+    matches!(name, "execute_command" | "run_check")
+}
 pub const MAX_FILE: u64 = 512 * 1024;
 pub fn workspace(path: &str) -> Result<PathBuf> {
     let root = std::fs::canonicalize(path)?;
@@ -332,6 +336,11 @@ pub fn definitions() -> Vec<Value> {
             json!({"command":{"type":"string"}}),
         ),
         (
+            "run_check",
+            "Run a targeted test, smoke check, or project test suite against the current workspace. State the behavior or failure case it checks. Use a command whose exit status reflects the assertions, and do not edit source in this command. Requires approval. 120 second timeout.",
+            json!({"command":{"type":"string"},"purpose":{"type":"string"}}),
+        ),
+        (
             "verify_npm_app",
             "Verify a new root npm app with a start script. First install its dependencies using an approved npm install if needed. This tool checks installed direct dependency versions against the registry and runs npm start. Electron apps must open a renderer page. Requests approval and stops only the launch it owns.",
             json!({}),
@@ -364,6 +373,13 @@ pub fn validate(name: &str, args: &Value) -> Result<()> {
                 .all(|k| obj.get(k).is_some_and(Value::is_string)),
         "Tool arguments do not match schema"
     );
+    if name == "run_check" {
+        let purpose = string(args, "purpose")?;
+        ensure!(
+            !purpose.trim().is_empty() && purpose.len() <= 512,
+            "A check requires a purpose of at most 512 bytes"
+        );
+    }
     Ok(())
 }
 pub async fn execute(
@@ -384,7 +400,9 @@ pub async fn execute(
             )
             .await?
         )),
-        "execute_command" => command(root, string(args, "command")?, cancel, output).await,
+        "execute_command" | "run_check" => {
+            command(root, string(args, "command")?, cancel, output).await
+        }
         "verify_npm_app" => verify_npm_app(root, cancel, output).await,
         "search_repository" => {
             let result = tokio::time::timeout(

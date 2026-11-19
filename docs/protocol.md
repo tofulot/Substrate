@@ -14,7 +14,7 @@ The transport is UTF-8, newline-delimited JSON-RPC 2.0 over stdin/stdout. Each r
 | `ping` | none | version and provider |
 | `project.open` | `path` | canonical path, name, Git branch |
 | `session.create` | `project` | new session |
-| `session.list` | none | recent session metadata |
+| `session.list` | none | all saved session metadata, most recently updated first |
 | `session.resume` | `session_id` | persisted messages, tool activities, and running state |
 | `agent.start` | `session_id`, `task`, optional `approval_mode` (`ask` by default, or `approve_edits`) | immediate acknowledgment; asynchronous events follow |
 | `agent.interrupt`, `session.cancel` | `session_id` | cancellation acknowledgment |
@@ -54,6 +54,10 @@ Notifications have no `id`. Each agent/tool notification includes `params.sessio
 - `usage.updated`: `call_id`
 
 Tools have `approval`, `running`, `completed`, `failed`, or `rejected` status. Approval IDs are scoped to their session and consumed once. Registering an approval waiter precedes publishing its notification. Closing the app cancels jobs; pending approval cards are displayed as interrupted after restoration.
+
+An applied patch or a shell command that changes the workspace inventory requires verification before the run can complete. The agent uses `run_check` with a `command` and a `purpose` describing the behavior under test. The check requires command approval and succeeds with exit code zero. The harness discards premature final answers and gives the agent a chance to continue. Edits invalidate earlier checks, and failed or declined checks leave verification incomplete. If the agent stops without passing verification, the run emits `agent.failed`.
+
+For bug fixes, the harness prompts the model to check both the reported failure and existing behavior the change could break. It asks the model to compare the original and updated implementations when practical and review coverage after a check passes.
 
 On macOS and Linux, a run that adds a root `package.json` start script must pass `verify_npm_app` before a final answer can report completion. The tool requires command approval, checks installed direct dependencies against npm, and supervises `npm start`. For Electron it checks the installed major against the supported stable release lines and waits for a renderer page before stopping the test launch. A syntax check or an arbitrary shell command does not satisfy this requirement.
 

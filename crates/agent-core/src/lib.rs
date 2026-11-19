@@ -346,6 +346,37 @@ pub async fn run(
     }
     result
 }
+async fn inventory_digest(root: &std::path::Path, cancel: &CancellationToken) -> Result<String> {
+    let root = root.to_path_buf();
+    let cancel = cancel.clone();
+    tokio::task::spawn_blocking(move || {
+        agent_context::inventory(&root, &cancel).map(|inventory| inventory.digest)
+    })
+    .await?
+}
+
+#[derive(Default)]
+struct Verification {
+    required: bool,
+    passed_at: Option<String>,
+    failure: Option<String>,
+}
+impl Verification {
+    fn invalidate(&mut self) {
+        self.required = true;
+        self.passed_at = None;
+    }
+
+    fn pending(&self, digest: &str) -> bool {
+        self.required && self.passed_at.as_deref() != Some(digest)
+    }
+
+    fn failed(&mut self, message: String) {
+        self.passed_at = None;
+        self.failure = Some(message);
+    }
+}
+
 async fn loop_run(
     session: &mut Session,
     config: &RunConfig,
@@ -358,9 +389,11 @@ async fn loop_run(
     let root = agent_tools::workspace(&session.project)?;
     let instructions = agent_context::instructions(&session.project, config.approval_mode);
     let check_new_npm_app = cfg!(unix) && agent_tools::npm_start_script(&root).await.is_none();
-    let mut verified_inventory = None;
+    let mut verification = Verification::default();
+    let mut npm_verification = Verification::default();
+    let mut initial_digest = None;
+    let mut shell_ran = false;
     let mut premature_finishes = 0;
-    let mut verification_failure = None;
     let task = selection_task(session);
     let mut selection_cache = None;
     let mut promoted = Vec::new();
@@ -386,20 +419,34 @@ async fn loop_run(
             }),
         )
         .await?;
-        let needs_verification = check_new_npm_app
-            && agent_tools::npm_start_script(&root).await.is_some()
-            && (verified_inventory.is_none()
-                || verified_inventory.as_ref()
-                    != packet
-                        .manifest
-                        .selection
-                        .as_ref()
-                        .map(|s| &s.inventory_digest));
+        let digest = &packet
+            .manifest
+            .selection
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Missing workspace inventory for verification"))?
+            .inventory_digest;
+        let baseline = initial_digest.get_or_insert_with(|| digest.clone());
+        verification.required |= shell_ran && digest != baseline;
+        npm_verification.required =
+            check_new_npm_app && agent_tools::npm_start_script(&root).await.is_some();
+        let needs_npm = npm_verification.pending(digest);
+        let needs_verification = needs_npm || verification.pending(digest);
+        let buffer_text = needs_verification || verification.required || npm_verification.required;
         let mut instructions = instructions.clone();
+        if needs_npm {
+            instructions.push_str(
+                "\nThe new npm app has no successful dependency and startup verification for its current workspace. Use verify_npm_app after installing dependencies.",
+            );
+        }
         if needs_verification {
             instructions.push_str(
-                "\nThe new npm app has no successful dependency and startup verification for its current workspace. Use verify_npm_app after installing dependencies. If verification fails, fix the reported issue before finishing. If approval was declined, report it as a blocker.",
+                "\nVerification is incomplete. Inspect the changes and use run_check to exercise the fix and existing behavior the edit could break. Fix any failure and rerun the relevant checks against the latest code. If verification is blocked, use any permitted alternative or state the blocker. Do not claim completion.",
             );
+            if premature_finishes > 0 {
+                instructions.push_str("\nThe previous answer was withheld because verification is incomplete. Continue with a tool call if you can verify the changes.");
+            }
+        } else if buffer_text {
+            instructions.push_str("\nA check passed on the current workspace. Review its output and the edit. Check that earlier failures are resolved and that the patch preserves behavior that worked before the fix. Look at the old and new code to enumerate supported variants of the affected input or behavior. When there are only a few materially different variants, run a focused check for each, including less common valid forms the old code handled. If the set is large, choose representative variants based on what the edit could break. Report which checks passed and any relevant coverage gaps.");
         }
         runtime.emit("context.updated",json!({"session_id":session.id,"snapshot_id":packet.manifest.id,"revision":packet.manifest.revision})).await;
         let mut versions = read_versions(&session.input);
@@ -440,7 +487,7 @@ async fn loop_run(
             let mut text = String::new();
             while let Some(delta) = rx.recv().await {
                 text.push_str(&delta);
-                if !needs_verification {
+                if !buffer_text {
                     rt.emit(
                         "agent.message.delta",
                         json!({"session_id":sid,"message_id":mid,"delta":delta}),
@@ -484,22 +531,36 @@ async fn loop_run(
                 json!({"session_id":session.id,"call_id":trace.id}),
             )
             .await;
-        if needs_verification && trace.tool_calls == 0 && output.output.is_ok() {
-            premature_finishes += 1;
-            if premature_finishes >= 2
-                || verification_failure.as_deref() == Some("Launch verification was declined.")
-            {
-                anyhow::bail!(
-                    "The app has not passed dependency and startup verification. {}",
-                    verification_failure
-                        .as_deref()
-                        .unwrap_or("The model stopped before running verify_npm_app.")
-                );
-            }
-            continue;
-        }
-        if !text.is_empty() {
+        if trace.tool_calls == 0 && output.output.is_ok() {
+            ensure!(!cancel.is_cancelled(), "Interrupted");
             if needs_verification {
+                premature_finishes += 1;
+                let failure = if needs_npm {
+                    &npm_verification.failure
+                } else {
+                    &verification.failure
+                };
+                if premature_finishes >= 2
+                    || failure.as_deref() == Some("Check approval was declined.")
+                {
+                    anyhow::bail!(
+                        "Verification incomplete. {}",
+                        failure.as_deref().unwrap_or(if needs_npm {
+                            "The new npm app still needs dependency and startup verification."
+                        } else {
+                            "The model stopped before a check passed on the current changes."
+                        })
+                    );
+                }
+                continue;
+            }
+            if buffer_text && inventory_digest(&root, cancel).await? != *digest {
+                continue;
+            }
+        }
+        premature_finishes = 0;
+        if !text.is_empty() && !needs_verification {
+            if buffer_text {
                 runtime
                     .emit(
                         "agent.message.delta",
@@ -520,13 +581,16 @@ async fn loop_run(
                 json!({"session_id":session.id,"message_id":message_id}),
             )
             .await;
-        let output = match output.output {
+        let mut output = match output.output {
             Ok(o) => o,
             Err(e) => {
                 storage.save(session).await?;
                 return Err(e);
             }
         };
+        if needs_verification {
+            output.retain(|item| item["type"] != "message");
+        }
         let calls: Vec<_> = output
             .iter()
             .filter(|v| v["type"] == "function_call")
@@ -543,8 +607,14 @@ async fn loop_run(
             let call_id = call["call_id"].as_str().unwrap_or("");
             let args: Result<Value, _> =
                 serde_json::from_str(call["arguments"].as_str().unwrap_or("{}"));
+            let is_check = matches!(name, "run_check" | "verify_npm_app");
+            let before_check = if is_check {
+                Some(inventory_digest(&root, cancel).await?)
+            } else {
+                None
+            };
             run_trace.tool_calls += 1;
-            let result = match args {
+            let mut result = match args {
                 Ok(args) => run_tool(
                     session,
                     name,
@@ -594,28 +664,47 @@ async fn loop_run(
                 }),
                 Err(e) => Err(e.into()),
             };
-            if name == "verify_npm_app" {
-                match &result {
-                    Ok(value) if value["verified"] == true => {
-                        let root = root.clone();
-                        let cancel = cancel.clone();
-                        verified_inventory = Some(
-                            tokio::task::spawn_blocking(move || {
-                                agent_context::inventory(&root, &cancel)
-                                    .map(|inventory| inventory.digest)
-                            })
-                            .await??,
-                        );
-                        verification_failure = None;
+            let rejected = result.as_ref().is_ok_and(|value| value["rejected"] == true);
+            shell_ran |= (agent_tools::is_shell_tool(name) || is_check) && !rejected;
+            if name == "apply_patch" && result.as_ref().is_ok_and(|value| value["applied"] == true)
+            {
+                verification.invalidate();
+                npm_verification.passed_at = None;
+            }
+            if let Some(before) = before_check {
+                let passed = result.as_ref().is_ok_and(|value| {
+                    if name == "verify_npm_app" {
+                        value["verified"] == true
+                    } else {
+                        value["exit_code"] == 0
                     }
-                    Ok(value) if value["rejected"] == true => {
-                        verification_failure = Some("Launch verification was declined.".into());
+                });
+                let state = if name == "verify_npm_app" {
+                    &mut npm_verification
+                } else {
+                    &mut verification
+                };
+                if passed && inventory_digest(&root, cancel).await? == before {
+                    state.passed_at = Some(before.clone());
+                    state.failure = None;
+                    if name == "verify_npm_app" && verification.failure.is_none() {
+                        verification.passed_at = Some(before);
                     }
-                    Err(error) => {
-                        verification_failure =
-                            Some(agent_context::bounded(&error.to_string(), 512).to_owned());
-                    }
-                    _ => {}
+                } else {
+                    let message = match &result {
+                        _ if rejected => "Check approval was declined.".into(),
+                        Ok(value) if passed => {
+                            let message = "Workspace files changed during the check. Rerun it against the resulting code.";
+                            result = Ok(json!({"result": value, "verification_error": message}));
+                            message.into()
+                        }
+                        Err(error) => agent_context::bounded(&error.to_string(), 512).to_owned(),
+                        Ok(value) if name == "run_check" => {
+                            format!("The check failed (exit code {}).", value["exit_code"])
+                        }
+                        Ok(_) => "App launch verification failed.".into(),
+                    };
+                    state.failed(message);
                 }
             }
             let output = match result {
@@ -629,9 +718,14 @@ async fn loop_run(
             storage.save_run(run_trace).await?;
         }
     }
+    let verification_status = if verification.required || npm_verification.required {
+        " The run ended before the model could confirm verification and report the result."
+    } else {
+        ""
+    };
     anyhow::bail!(
-        "Stopped after {} model turns. Send a follow-up to continue.",
-        config.max_steps
+        "Stopped after {} model turns.{verification_status}",
+        config.max_steps,
     )
 }
 struct ToolContext<'a> {
@@ -681,7 +775,8 @@ async fn run_tool(
     } else {
         None
     };
-    let requires_approval = matches!(name, "execute_command" | "verify_npm_app")
+    let requires_approval = agent_tools::is_shell_tool(name)
+        || name == "verify_npm_app"
         || (name == "apply_patch" && context.approval_mode == ApprovalMode::Ask);
     let mut tool = ToolActivity {
         id: id(),
@@ -784,7 +879,7 @@ async fn run_tool(
     context.trace.tool_ms += executing.elapsed().as_millis() as u64;
     tool.status = if result
         .as_ref()
-        .is_ok_and(|value| name != "execute_command" || value["exit_code"] == 0)
+        .is_ok_and(|value| !agent_tools::is_shell_tool(name) || value["exit_code"] == 0)
     {
         "completed"
     } else {

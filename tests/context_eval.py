@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -25,9 +26,17 @@ class Case:
     edits: tuple = ()
 
     @property
+    def check(self):
+        if self.name == "edit-retry":
+            code = "from billing.recovery import RETRY_WINDOW_MINUTES; assert RETRY_WINDOW_MINUTES == 60"
+        else:
+            code = "import runpy; runpy.run_path('tests/test_download.py')['test_csv_download_limit']()"
+        return "python3 -B -c " + shlex.quote(code)
+
+    @property
     def prompt(self):
         if self.edits:
-            return self.task + " Edit the source using file tools. Do not run shell commands."
+            return self.task + " Edit the source using file tools, then verify with this exact command: " + self.check
         return self.task + " Reply with only the integer. Use read-only tools if needed."
 
 
@@ -128,8 +137,12 @@ class Fixture(BaseHTTPRequestHandler):
         tool_names = {call["function"]["name"] for message in messages
                       for call in message.get("tool_calls", [])}
         tools = []
-        if "apply_patch" in tool_names:
+        if "run_check" in tool_names:
+            assert json.loads(messages[-1]["content"])["exit_code"] == 0
             delta = {"content": "Edited."}
+        elif "apply_patch" in tool_names:
+            tools = [("run_check", {"command": case.check,
+                                    "purpose": "Assert the updated limit"})]
         elif missing and "read_file" in tool_names:
             delta = {"content": "promotion failed"}
         elif missing:
@@ -199,8 +212,10 @@ def run_case(directory, case, size, mode, url, key, timeout):
                     break
                 tool = event["params"]["tool"]
                 path = tool.get("preview", {}).get("path") if tool.get("preview") else None
-                approved = tool["name"] == "apply_patch" and path is not None and Path(path).as_posix() in targets
-                approved_edits += int(approved)
+                is_edit = tool["name"] == "apply_patch" and path is not None and Path(path).as_posix() in targets
+                is_check = bool(case.edits) and tool["name"] == "run_check" and tool["arguments"]["command"] == case.check
+                approved = is_edit or is_check
+                approved_edits += int(is_edit)
                 rejected_tools += int(not approved)
                 client.rpc("tool.approve" if approved else "tool.reject",
                            session_id=session, tool_id=tool["id"])

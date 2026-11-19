@@ -71,6 +71,47 @@ class Model(BaseHTTPRequestHandler):
             events = [{"choices": [{"delta": {"content": "Relevant source selected."}, "finish_reason": None}]}]
         elif task == 'provider_error':
             self.send_response(403); self.end_headers(); self.wfile.write(b'do-not-store-this-provider-body'); return
+        elif task == 'verify_behavior':
+            count = len(outputs)
+            check = {'command': "test \"$(cat result.txt)\" = edge-case",
+                     'purpose': 'Check that the boundary case produces the expected result'}
+            if count == 0:
+                assert 'against the original and updated code' in messages[0]['content']
+                events = call('apply_patch', {'path': 'result.txt', 'old_text': '', 'new_text': 'wrong'})
+            elif count == 1 and 'previous answer was withheld' not in messages[0]['content']:
+                events = [{"choices": [{"delta": {"content": "False completion."}}]}]
+            elif count == 1:
+                assert 'False completion.' not in json.dumps(messages)
+                assert 'existing behavior the edit could break' in messages[0]['content']
+                events = call('run_check', check)
+            elif count == 2:
+                assert json.loads(outputs[-1]['content'])['exit_code'] == 1
+                assert 'Verification is incomplete' in messages[0]['content']
+                events = call('apply_patch', {'path': 'result.txt', 'old_text': 'wrong', 'new_text': 'edge-case'})
+            elif count == 3:
+                events = call('run_check', check)
+            elif count == 4:
+                assert json.loads(outputs[-1]['content'])['exit_code'] == 0
+                assert 'behavior that worked before the fix' in messages[0]['content']
+                assert 'run a focused check for each' in messages[0]['content']
+                events = call('execute_command', {'command': "printf 'edge-case\\n' > result.txt"})
+            elif count == 5 and 'previous answer was withheld' not in messages[0]['content']:
+                assert json.loads(outputs[-1]['content'])['exit_code'] == 0
+                assert 'Verification is incomplete' in messages[0]['content']
+                events = [{"choices": [{"delta": {"content": "False completion."}}]}]
+            elif count == 5:
+                events = call('run_check', {**check, 'command': check['command'] +
+                                            " && printf 'edge-case\\n\\n' > result.txt"})
+            elif count == 6:
+                report = json.loads(outputs[-1]['content'])
+                assert report['result']['exit_code'] == 0
+                assert 'changed during the check' in report['verification_error']
+                assert 'Verification is incomplete' in messages[0]['content']
+                events = call('run_check', check)
+            else:
+                assert json.loads(outputs[-1]['content'])['exit_code'] == 0
+                assert 'Review its output' in messages[0]['content']
+                events = [{"choices": [{"delta": {"content": "The boundary case passed."}}]}]
         elif task == 'verify_new_npm_app':
             if not outputs:
                 events = call('apply_patch', {
@@ -108,7 +149,8 @@ class Model(BaseHTTPRequestHandler):
                 events = call('apply_patch', {'path': 'automatic.txt', 'old_text': '', 'new_text': 'auto applied'})
             elif len(outputs) == 1:
                 assert json.loads(outputs[-1]['content'])['applied']
-                events = call('execute_command', {'command': 'touch command-ran.txt'})
+                events = call('run_check', {'command': 'touch command-ran.txt',
+                                            'purpose': 'Exercise the rejected check path'})
             else:
                 assert json.loads(outputs[-1]['content'])['rejected']
                 events = [{"choices": [{"delta": {"content": "Applied the patch."}, "finish_reason": None}]}]
@@ -125,7 +167,8 @@ class Model(BaseHTTPRequestHandler):
             events = call('apply_patch', {'path': 'hello.txt', 'old_text': 'hello', 'new_text': 'hello substrate'})
         elif len(outputs) == 3:
             assert json.loads(outputs[-1]['content'])['applied']
-            events = call('execute_command', {'command': "printf 'verified\\n'; test -z \"$SUBQ_API_KEY\""})
+            events = call('run_check', {'command': "test \"$(cat hello.txt)\" = 'hello substrate' && test -z \"$SUBQ_API_KEY\" && printf 'verified\\n'",
+                                        'purpose': 'Verify the edit and credential isolation'})
         else:
             assert json.loads(outputs[-1]['content'])['exit_code'] == 0
             events = [{"choices": [{"delta": {"content": 'Done. 世界'}, "finish_reason": None}]}]
@@ -242,7 +285,7 @@ def main():
         assert approval['preview']['after'] == 'hello substrate'
         client.rpc('tool.approve', session_id=session, tool_id=approval['id'])
         approval = client.wait('tool.approval.required')['tool']
-        assert approval['name'] == 'execute_command'
+        assert approval['name'] == 'run_check'
         client.rpc('tool.approve', session_id=session, tool_id=approval['id'])
         client.wait('agent.completed')
         assert (repo / 'hello.txt').read_text() == 'hello substrate'
@@ -277,15 +320,31 @@ def main():
         automatic = client.rpc('session.create', project=str(repo))['id']
         client.rpc('agent.start', session_id=automatic, task='approve_edits', approval_mode='approve_edits')
         approval = client.wait('tool.approval.required', lambda p: p.get('session_id') == automatic)['tool']
-        assert approval['name'] == 'execute_command'
+        assert approval['name'] == 'run_check'
         assert (repo / 'automatic.txt').read_text() == 'auto applied'
         assert not (repo / 'command-ran.txt').exists()
         client.rpc('tool.reject', session_id=automatic, tool_id=approval['id'])
-        client.wait('agent.completed', lambda p: p.get('session_id') == automatic)
+        blocked = client.wait('agent.failed', lambda p: p.get('session_id') == automatic)
+        assert 'Check approval was declined.' in blocked['message']
         assert not (repo / 'command-ran.txt').exists()
         automatic_messages = client.rpc('session.resume', session_id=automatic)['messages']
         patch = next(m['tool'] for m in automatic_messages if m.get('tool', {}).get('name') == 'apply_patch')
         assert patch['status'] == 'completed' and patch['preview']['after'] == 'auto applied'
+        assert not any(m['role'] == 'assistant' for m in automatic_messages)
+        # A failing check forces a fix and a later shell edit makes passing evidence stale.
+        behavior = client.rpc('session.create', project=str(repo))['id']
+        for_behavior = lambda params: params.get('session_id') == behavior
+        client.rpc('agent.start', session_id=behavior, task='verify_behavior', approval_mode='approve_edits')
+        for name in ['run_check', 'run_check', 'execute_command', 'run_check', 'run_check']:
+            approval = client.wait('tool.approval.required', for_behavior)['tool']
+            assert approval['name'] == name
+            client.rpc('tool.approve', session_id=behavior, tool_id=approval['id'])
+        client.wait('agent.completed', for_behavior)
+        behavior_messages = client.rpc('session.resume', session_id=behavior)['messages']
+        assert [m['content'] for m in behavior_messages if m['role'] == 'assistant'] == ['The boundary case passed.']
+        assert [m['tool']['status'] for m in behavior_messages
+                if m.get('tool', {}).get('name') == 'run_check'] == ['failed', 'completed', 'completed', 'completed']
+        assert not any('False completion.' in json.dumps(e) for e in client.events)
         # An external edit that preserves old_text must still invalidate the model's proposal.
         stale = client.rpc('session.create', project=str(repo))['id']
         client.rpc('agent.start', session_id=stale, task='stale', approval_mode='approve_edits')
