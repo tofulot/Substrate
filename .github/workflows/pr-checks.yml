@@ -1,0 +1,62 @@
+name: PR checks
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-checks-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: PR checks (macOS)
+    runs-on: macos-15
+    timeout-minutes: 25
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          cache: npm
+      - name: Set up Rust and portable ripgrep
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
+          rustup override set 1.95.0
+          bash scripts/install-ci-ripgrep.sh
+      - name: Install locked npm dependencies
+        run: npm ci
+      - name: Check source and test harness
+        run: |
+          npm run check
+          npm test
+          node --test tests/release.test.mjs
+      - name: Run scripted context eval
+        run: |
+          # The first parent of GitHub's PR merge commit is the base branch tip.
+          changed=$(git diff --name-only HEAD^1 HEAD -- crates/ Cargo.toml Cargo.lock \
+            tests/ package.json package-lock.json .github/workflows/pr-checks.yml)
+          if [[ -n "$changed" ]]; then
+            npm run eval:context
+          fi
+      - name: Build Electron bundles
+        run: npx --no-install electron-vite build
+      - name: Smoke test the desktop app
+        id: desktop
+        timeout-minutes: 5
+        run: npm run test:desktop
+      - name: Upload desktop screenshots
+        if: ${{ !cancelled() && (steps.desktop.outcome == 'success' || steps.desktop.outcome == 'failure') }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pr-desktop-screenshots
+          if-no-files-found: ignore
+          retention-days: 7
+          path: test-results/*.png

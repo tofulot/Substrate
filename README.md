@@ -98,8 +98,10 @@ Manual runs execute the same build and test steps and save the downloadable file
 
 ## Verify
 
+The **PR checks (macOS)** job runs source checks, harness and release-script tests, and the Electron desktop smoke test on pull requests. It uploads desktop screenshots and runs the scripted context evaluation when harness or test inputs change. The job can be selected as a required status check in GitHub branch rules.
+
 ```sh
-npm run check             # Rust formatting, Clippy, strict TypeScript
+npm run check             # Electron import boundary, Rust formatting, Clippy, strict TypeScript
 npm test                  # Rust unit tests + real-server integration tests
 npx electron-vite build   # build renderer, main, and preload
 npm run test:desktop      # launches the real Electron app and Rust harness
