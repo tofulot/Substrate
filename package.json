@@ -17,7 +17,7 @@
     "eval:context": "python3 tests/context_eval.py",
     "test:desktop": "node tests/electron.mjs",
     "format": "prettier --write src electron shared *.json *.ts",
-    "check": "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && npm run typecheck"
+    "check": "node scripts/check-electron-imports.mjs && cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && npm run typecheck"
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.1.15",
