@@ -228,9 +228,9 @@ export default function Insights({
                 </span>
                 {selection.reason && <span>{selection.reason}</span>}
                 <span>
-                  Snap evaluates up to 128 task-ranked files using bounded
-                  excerpts. Other files use local relevance. Rankings are reused
-                  until the task or files change.
+                  Automatic selection can use local ranking or send up to 128
+                  task-ranked files to Snap. Scores for unchanged files can be
+                  reused after an edit.
                 </span>
               </div>
             )}
@@ -287,12 +287,27 @@ export default function Insights({
                 recorded. Selection ranks full eligible files within the payload
                 budget; small applicable AGENTS.md files are kept first.
               </p>
-              {snapshot.excluded.map((entry, i) => (
-                <div key={`${entry.path}-${i}`}>
-                  <code>{entry.path}</code>
-                  <span>{entry.reason}</span>
-                </div>
-              ))}
+              {snapshot.excluded.map((entry, i) => {
+                const rank = ranks.get(entry.path);
+                const shortlist =
+                  selection?.model && rank?.local_rank
+                    ? rank.snap_candidate
+                      ? "On Snap shortlist"
+                      : "Outside Snap shortlist"
+                    : "";
+                const details = [
+                  rank?.local_rank && `Local rank ${rank.local_rank}`,
+                  shortlist,
+                ]
+                  .filter(Boolean)
+                  .join(" · ");
+                return (
+                  <div key={`${entry.path}-${i}`} title={details || undefined}>
+                    <code>{entry.path}</code>
+                    <span>{entry.reason}</span>
+                  </div>
+                );
+              })}
             </details>
           </>
         ) : (
@@ -439,6 +454,9 @@ export default function Insights({
                   <dt>Context / history</dt>
                   <dd>
                     {bytes(call.context_bytes)} / {bytes(call.history_bytes)}
+                    {call.history_stored_bytes != null && (
+                      <> sent of {bytes(call.history_stored_bytes)} stored</>
+                    )}
                   </dd>
                 </div>
                 <div>

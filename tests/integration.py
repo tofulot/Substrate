@@ -8,6 +8,7 @@ from pathlib import Path
 import queue
 import subprocess
 import sqlite3
+import sys
 import tempfile
 import threading
 import time
@@ -35,7 +36,7 @@ class Model(BaseHTTPRequestHandler):
         assert self.headers['Authorization'] == 'Bearer fixture-key'
         if self.path == '/v1/systemone':
             snap_requests.append(body)
-            assert body['model'] == 'subq-snap-1.1'
+            assert body['model'] == 'subq-snap-1.2'
             assert 1 <= len(body['questions']) <= 128
             assert len(json.dumps(body).encode()) <= 512*1024
             assert 'PRIVATE_TEST_SECRET' not in json.dumps(body) and 'ignored-source-data' not in json.dumps(body)
@@ -56,10 +57,13 @@ class Model(BaseHTTPRequestHandler):
             return
         requests.append(body)
         assert self.path == '/v1/chat/completions'
-        assert body['model'] == 'subq-preview' and body['stream'] and body['store'] is False
+        assert body['model'] == 'subq-savant-1.4' and body['stream'] and body['store'] is False
+        assert body['max_tokens'] == 65_536
         assert body['tools'][0]['function']['parameters']['additionalProperties'] is False
         messages = body['messages']
         task = next(m['content'] for m in reversed(messages) if m['role'] == 'user')
+        if task != 'review_once' and task != 'review_stalled':
+            assert body['reasoning_effort'] == 'medium'
         outputs = [m for m in messages if m['role'] == 'tool']
         assert messages[1]['role'] == 'user' and messages[1]['content'].startswith('Repository snapshot ')
         assert 'PRIVATE_TEST_SECRET' not in messages[1]['content']
@@ -69,6 +73,91 @@ class Model(BaseHTTPRequestHandler):
             wanted, other = ('a-boilerplate.rs', 'z-billing.rs') if task == 'selection_other' else ('z-billing.rs', 'a-boilerplate.rs')
             assert wanted in paths and other not in paths, paths
             events = [{"choices": [{"delta": {"content": "Relevant source selected."}, "finish_reason": None}]}]
+        elif task == 'turn_budget':
+            if len(outputs) < 21:
+                events = call('list_files', {'path': ''})
+            else:
+                events = [{"choices": [{"delta": {"content": "Continued past turn 20."}}]}]
+        elif task == 'history_budget':
+            if not outputs:
+                events = [event for index in range(3)
+                          for event in call('read_file', {'path': f'large-{index}.txt'}, index)]
+            else:
+                assistant = next(m for m in messages if m.get('tool_calls'))
+                assert [m['tool_call_id'] for m in outputs] == [c['id'] for c in assistant['tool_calls']]
+                assert all('bytes omitted' in m['content'] for m in outputs)
+                assert 'may omit older turns' in messages[0]['content']
+                events = [{"choices": [{"delta": {"content": "Continued after large reads."}}]}]
+        elif task == 'review_once':
+            if not outputs:
+                assert body['reasoning_effort'] == 'medium'
+                events = call('apply_patch', {'path': 'first.txt', 'old_text': '', 'new_text': 'one'})
+                events += call('apply_patch', {'path': 'second.txt', 'old_text': '', 'new_text': 'two'}, 1)
+            elif len(outputs) == 2:
+                assert body['reasoning_effort'] == 'medium'
+                events = call('run_check', {'command': 'test -f first.txt && test -f second.txt',
+                                            'purpose': 'Both related files were created'})
+                for index in range(3):
+                    events += call('read_file', {'path': f'large-{index}.txt'}, index + 1)
+            else:
+                assert body['reasoning_effort'] == 'max'
+                assert 'single review turn' in messages[0]['content']
+                assert 'may omit older turns' in messages[0]['content']
+                evidence = json.loads(messages[1]['content'].splitlines()[-1])
+                assert not evidence['verification_pending']
+                assert evidence['recent_checks'][-1]['exit_code'] == 0
+                assert evidence['recent_checks'][-1]['purpose'] == 'Both related files were created'
+                events = [{"choices": [{"delta": {"content": "Reviewed both edits."}}]}]
+        elif task == 'review_stalled':
+            if len(outputs) < 3:
+                assert body['reasoning_effort'] == 'medium'
+                events = call('read_file', {'path': 'missing.txt'})
+            elif body['reasoning_effort'] == 'max':
+                self.send_response(503)
+                self.end_headers()
+                return
+            else:
+                review_requests = [r for r in requests if r['messages'][-1]['role'] == 'tool'
+                                   and any(m.get('content') == task for m in r['messages'])
+                                   and r['reasoning_effort'] == 'max']
+                assert len(review_requests) == 1
+                events = [{"choices": [{"delta": {"content": "Recovered on the standard turn."}}]}]
+        elif task == 'isolated_checks':
+            tools = {tool['function']['name'] for tool in body['tools']}
+            assert {'run_check', 'search_repository', 'read_file', 'apply_patch'} <= tools
+            assert not ({'execute_command', 'verify_npm_app', 'web_search', 'fetch_url'} & tools)
+            assert 'workspace is read-only' in messages[0]['content']
+            check = {
+                'command': (
+                    'cat > "$TMPDIR/probe.txt" <<\'PROBE\'\nscratch\nPROBE\n'
+                    'test "$(cat "$TMPDIR/probe.txt")" = scratch || exit 90\n'
+                    '(printf tamper > fixture.txt) 2>/dev/null && exit 91\n'
+                    'cat ../external.txt >/dev/null 2>&1 && exit 92\n'
+                    f'curl -sS --max-time 2 http://127.0.0.1:{self.server.server_port}/ >/dev/null 2>&1 && exit 93\n'
+                    'test "$(cat fixture.txt)" = fixed'
+                ),
+                'purpose': 'Reproduce the bug and exercise sandbox boundaries',
+            }
+            if not outputs:
+                events = call('execute_command', {'command': 'touch should-not-exist'})
+                events += call('run_check', check, 1)
+            elif len(outputs) == 2:
+                assert 'unavailable' in json.loads(outputs[0]['content'])['error']
+                assert json.loads(outputs[1]['content'])['exit_code'] == 1
+                events = call('apply_patch', {'path': 'fixture.txt', 'old_text': 'original', 'new_text': 'fixed'})
+            elif len(outputs) == 3:
+                events = call('run_check', check)
+            elif len(outputs) == 4:
+                assert json.loads(outputs[-1]['content'])['exit_code'] == 0
+                events = call('run_check', {'command': 'test -e absent.txt',
+                                            'purpose': 'A negative control can fail',
+                                            'kind': 'probe'})
+            else:
+                assert json.loads(outputs[-1]['content'])['exit_code'] == 1
+                evidence = json.loads(messages[1]['content'].splitlines()[-1])
+                assert not evidence['verification_pending']
+                assert evidence['recent_checks'][-1]['kind'] == 'probe'
+                events = [{"choices": [{"delta": {"content": "Verified in isolation."}}]}]
         elif task == 'provider_error':
             self.send_response(403); self.end_headers(); self.wfile.write(b'do-not-store-this-provider-body'); return
         elif task == 'verify_behavior':
@@ -129,12 +218,32 @@ class Model(BaseHTTPRequestHandler):
             else:
                 assert json.loads(outputs[-1]['content'])['verified'] is True
                 events = [{"choices": [{"delta": {"content": "App launch verified."}, "finish_reason": None}]}]
+        elif task == 'chained_edits':
+            assert '"path":"chained.txt"' not in messages[1]['content']
+            if not outputs:
+                events = call('read_file', {'path': './chained.txt', 'start_line': 1, 'end_line': 1})
+                events += call('apply_patch', {'path': 'chained.txt', 'old_text': 'alpha', 'new_text': 'ALPHA'}, 1)
+                events += call('apply_patch', {'path': './chained.txt', 'old_text': 'beta', 'new_text': 'BETA'}, 2)
+            elif len(outputs) == 3:
+                assert [json.loads(item['content'])['applied'] for item in outputs[1:]] == [True, True]
+                events = call('apply_patch', {'path': 'chained.txt', 'old_text': 'BETA', 'new_text': 'OMEGA'})
+            elif len(outputs) == 4:
+                assert json.loads(outputs[-1]['content'])['applied'] is True
+                events = call('run_check', {
+                    'command': """test "$(head -n 1 chained.txt)" = 'ALPHA OMEGA'""",
+                    'purpose': 'Verify all three chained edits',
+                })
+            else:
+                assert json.loads(outputs[-1]['content'])['exit_code'] == 0
+                events = [{"choices": [{"delta": {"content": "Chained edits verified."}}]}]
         elif task == 'stale':
             if outputs:
+                assert json.loads(outputs[0]['content'])['content'].endswith('external')
                 assert 'changed since' in json.loads(outputs[-1]['content'])['error']
                 events = [{"choices": [{"delta": {"content": "Stale edit blocked."}, "finish_reason": None}]}]
             else:
-                events = call('apply_patch', {'path': 'hello.txt', 'old_text': 'hello substrate', 'new_text': 'wrong'})
+                events = call('read_file', {'path': 'hello.txt'})
+                events += call('apply_patch', {'path': 'hello.txt', 'old_text': 'hello substrate', 'new_text': 'wrong'}, 1)
         elif task == 'cancel_stream':
             self.send_response(200); self.send_header('Content-Type', 'text/event-stream'); self.end_headers()
             self.wfile.write(b'data: {"choices":[{"delta":{"content":"Started"},"finish_reason":null}]}\n\n'); self.wfile.flush()
@@ -265,6 +374,7 @@ def main():
         (repo / '.gitignore').write_text('ignored.txt\n')
         (repo / 'ignored.txt').write_text('ignored-source-data')
         client = Client(directory, url)
+        assert client.rpc('config.get')['max_steps'] == 64
         project = client.rpc('project.open', path=str(repo))
         session = client.rpc('session.create', project=project['path'])['id']
         baseline = client.rpc('context.get', session_id=session)['snapshot']
@@ -278,7 +388,7 @@ def main():
         first = client.send('ping'); second = client.send('config.get')
         responses = [client.messages.get(timeout=5), client.messages.get(timeout=5)]
         assert {r['id'] for r in responses} == {first, second}
-        client.rpc('agent.start', session_id=session, task='build')
+        client.rpc('agent.start', session_id=session, task='build', context_selection='snap')
         approval = client.wait('tool.approval.required')['tool']
         assert approval['name'] == 'apply_patch'
         assert (repo / 'hello.txt').read_text() == 'hello'
@@ -298,10 +408,13 @@ def main():
         selection = [c for c in usage['calls'] if c['kind'] == 'context_selection']
         assert len(generation) == 4 and len(selection) == 2 and usage['runs'][0]['status'] == 'completed'
         assert len(snap_requests) == 2, 'Reuse selection across reads and unchanged tool turns'
+        assert [f['path'] for f in snap_requests[1]['state']['files']] == ['hello.txt'], (
+            'Rescore the changed file and keep accepted decisions for unchanged paths'
+        )
         assert sum(c['metrics']['usage']['input_tokens'] for c in generation) == 4010
         assert all(c['metrics']['usage']['cached_tokens'] == 0 for c in generation)
         assert all(c['metrics']['duration_ms'] is not None and c['metrics']['first_output_ms'] is not None for c in generation)
-        assert all(c['model'] == 'subq-snap-1.1' and c['metrics']['usage']['output_tokens'] == 0 for c in selection)
+        assert all(c['model'] == 'subq-snap-1.2' and c['metrics']['usage']['output_tokens'] == 0 for c in selection)
         assert all(c['metrics']['request_bytes'] > c['context_bytes'] for c in usage['calls'])
         assert all(c['snapshot_id'] and c['run_id'] == usage['runs'][0]['id'] for c in usage['calls'])
         assert 'fixture-key' not in json.dumps(usage)
@@ -345,6 +458,41 @@ def main():
         assert [m['tool']['status'] for m in behavior_messages
                 if m.get('tool', {}).get('name') == 'run_check'] == ['failed', 'completed', 'completed', 'completed']
         assert not any('False completion.' in json.dumps(e) for e in client.events)
+        # Same-turn and later-turn edits use approved bytes even outside the snapshot.
+        chain_repo = directory / 'chained-edits'
+        chain_repo.mkdir()
+        (chain_repo / '.gitignore').write_text('chained.txt\n')
+        chain_file = chain_repo / 'chained.txt'
+        chain_file.write_text('alpha beta\nuntouched')
+        chain = client.rpc('session.create', project=str(chain_repo))['id']
+        client.rpc('agent.start', session_id=chain, task='chained_edits', context_selection='local')
+        for before, after in [('alpha beta', 'ALPHA beta'), ('ALPHA beta', 'ALPHA BETA'),
+                              ('ALPHA BETA', 'ALPHA OMEGA')]:
+            approval = client.wait('tool.approval.required', lambda p: p['session_id'] == chain)['tool']
+            assert (approval['preview']['before'], approval['preview']['after']) == (
+                before + '\nuntouched', after + '\nuntouched')
+            client.rpc('tool.approve', session_id=chain, tool_id=approval['id'])
+        approval = client.wait('tool.approval.required', lambda p: p['session_id'] == chain)['tool']
+        assert approval['name'] == 'run_check'
+        client.rpc('tool.approve', session_id=chain, tool_id=approval['id'])
+        client.wait('agent.completed', lambda p: p['session_id'] == chain)
+        assert chain_file.read_text() == 'ALPHA OMEGA\nuntouched'
+        if sys.platform == 'darwin':
+            isolated_repo = directory / 'isolated'
+            isolated_repo.mkdir()
+            (isolated_repo / 'fixture.txt').write_text('original')
+            (directory / 'external.txt').write_text('outside the test checkout')
+            isolated = client.rpc('session.create', project=str(isolated_repo))['id']
+            client.rpc('agent.start', session_id=isolated, task='isolated_checks',
+                       context_selection='local', check_mode='isolated', approval_mode='approve_edits')
+            for expected in ('original', 'fixed', 'fixed'):
+                approval = client.wait('tool.approval.required', lambda p: p['session_id'] == isolated)['tool']
+                assert approval['name'] == 'run_check'
+                assert (isolated_repo / 'fixture.txt').read_text() == expected
+                client.rpc('tool.approve', session_id=isolated, tool_id=approval['id'])
+            client.wait('agent.completed', lambda p: p['session_id'] == isolated)
+            assert not (isolated_repo / 'should-not-exist').exists()
+            assert (isolated_repo / 'fixture.txt').read_text() == 'fixed'
         # An external edit that preserves old_text must still invalidate the model's proposal.
         stale = client.rpc('session.create', project=str(repo))['id']
         client.rpc('agent.start', session_id=stale, task='stale', approval_mode='approve_edits')
@@ -355,6 +503,45 @@ def main():
         assert (repo / 'hello.txt').read_text() == 'hello substrate\nexternal'
         assert not any(e.get('method') == 'tool.approval.required' and e.get('params', {}).get('session_id') == stale for e in client.events)
         assert len(client.rpc('context.history', session_id=stale)) == 3
+        # The default budget allows a task to finish beyond the old turn limit.
+        extended = client.rpc('session.create', project=str(repo))['id']
+        client.rpc('agent.start', session_id=extended, task='turn_budget', context_selection='local', subq_review=False)
+        client.wait('agent.completed', lambda p: p['session_id'] == extended)
+        extended_calls = client.rpc('usage.get', session_id=extended)['calls']
+        assert len(extended_calls) == 22
+        # A batch of large file reads exceeds the stored history budget together.
+        large_history = directory / 'large-history'
+        large_history.mkdir()
+        original_read = 'text line\n' * 19_000
+        for index in range(3):
+            (large_history / f'large-{index}.txt').write_text(original_read)
+        history_session = client.rpc('session.create', project=str(large_history))['id']
+        client.rpc('agent.start', session_id=history_session, task='history_budget', context_selection='local')
+        client.wait('agent.completed', lambda p: p['session_id'] == history_session)
+        history_calls = client.rpc('usage.get', session_id=history_session)['calls']
+        bounded = next(call for call in history_calls if 'history_stored_bytes' in call)
+        assert bounded['history_stored_bytes'] > 512 * 1024 >= bounded['history_bytes']
+        database = directory / 'data' / 'test.db'
+        with sqlite3.connect(database) as db:
+            persisted = json.loads(db.execute('SELECT input FROM sessions WHERE id=?', (history_session,)).fetchone()[0])
+        reads = [json.loads(m['output'])['content'] for m in persisted if m.get('type') == 'function_call_output']
+        assert reads == [original_read] * 3
+        review = client.rpc('session.create', project=str(large_history))['id']
+        client.rpc('agent.start', session_id=review, task='review_once',
+                   context_selection='local', approval_mode='approve_edits')
+        approval = client.wait('tool.approval.required', lambda p: p['session_id'] == review)['tool']
+        assert approval['name'] == 'run_check'
+        client.rpc('tool.approve', session_id=review, tool_id=approval['id'])
+        client.wait('agent.completed', lambda p: p['session_id'] == review)
+        calls = sorted(client.rpc('usage.get', session_id=review)['calls'], key=lambda call: call['started_at'])
+        assert [call['metrics']['reasoning_effort'] for call in calls] == ['medium', 'medium', 'max']
+        stalled = client.rpc('session.create', project=str(repo))['id']
+        client.rpc('agent.start', session_id=stalled, task='review_stalled', context_selection='local')
+        client.wait('agent.completed', lambda p: p['session_id'] == stalled)
+        calls = sorted(client.rpc('usage.get', session_id=stalled)['calls'], key=lambda call: call['started_at'])
+        assert [call['metrics']['reasoning_effort'] for call in calls] == [
+            'medium', 'medium', 'medium', 'max', 'medium']
+        assert calls[-2]['status'] == 'failed' and calls[-1]['status'] == 'completed'
         # Provider failures and interrupted streams are traced without fabricated token counts.
         failed = client.rpc('session.create', project=str(repo))['id']
         client.rpc('agent.start', session_id=failed, task='provider_error'); client.wait('agent.failed')
@@ -411,13 +598,16 @@ def main():
         selective = directory / 'selective'; selective.mkdir()
         (selective / 'a-boilerplate.rs').write_text('unrelated boilerplate\n' * 1100)
         (selective / 'z-billing.rs').write_text('invoice settlement implementation\n' * 700)
-        client.rpc('config.update', model='subq-preview', context_budget_bytes=32*1024)
+        client.rpc('config.update', model='subq-savant-1.4', max_steps=96)
+        client.rpc('config.update', model='subq-savant-1.4', context_budget_bytes=32*1024)
+        assert client.rpc('config.get')['max_steps'] == 96
         for task, strategy in [('selection_semantic', 'snap'), ('snap_unavailable invoice', 'fallback'), ('snap_uncertain invoice', 'fallback'), ('snap_invalid invoice', 'fallback')]:
             selected = client.rpc('session.create', project=str(selective))['id']
             initial = client.rpc('context.get', session_id=selected)['snapshot']
             assert initial['files'][0]['path'] == 'a-boilerplate.rs'
             before = len(snap_requests)
-            client.rpc('agent.start', session_id=selected, task=task)
+            client.rpc('agent.start', session_id=selected, task=task, context_selection='snap',
+                       context_packing='whole_files')
             client.wait('agent.completed', lambda p: p.get('session_id') == selected)
             result = client.rpc('context.get', session_id=selected)
             assert not result['stale'] and result['snapshot']['selection']['strategy'] == strategy
@@ -431,7 +621,8 @@ def main():
             if task == 'selection_semantic':
                 before = len(snap_requests)
                 old_hash = result['snapshot']['selection']['task_hash']
-                client.rpc('agent.start', session_id=selected, task='selection_other')
+                client.rpc('agent.start', session_id=selected, task='selection_other', context_selection='snap',
+                           context_packing='whole_files')
                 client.wait('agent.completed', lambda p: p.get('session_id') == selected)
                 changed_task = client.rpc('context.get', session_id=selected)['snapshot']
                 assert changed_task['selection']['task_hash'] != old_hash
@@ -439,7 +630,7 @@ def main():
                 assert len(snap_requests) == before + 1, 'A new task must invalidate selection'
         interrupted_selection = client.rpc('session.create', project=str(selective))['id']
         before = len(requests)
-        client.rpc('agent.start', session_id=interrupted_selection, task='snap_cancel')
+        client.rpc('agent.start', session_id=interrupted_selection, task='snap_cancel', context_selection='snap')
         assert snap_ready.wait(timeout=5)
         started = time.monotonic()
         client.rpc('agent.interrupt', session_id=interrupted_selection)
@@ -467,7 +658,8 @@ def main():
         assert restored['messages'] == saved['messages']
         assert client.rpc('usage.get', session_id=session) == usage
         assert client.rpc('context.file', session_id=session, snapshot_id=baseline['id'], path='hello.txt')['content'] == 'hello'
-        assert 'key' not in client.rpc('config.get')
+        config = client.rpc('config.get')
+        assert 'key' not in config and config['max_steps'] == 96
         client.close()
     http.shutdown()
     print('PASS: real harness → SubQ fixture → tools → approvals → streaming → cancellation → restore')

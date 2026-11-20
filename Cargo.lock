@@ -43,8 +43,10 @@ dependencies = [
  "futures-util",
  "reqwest",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
+ "uuid",
 ]
 
 [[package]]
@@ -108,6 +110,7 @@ dependencies = [
  "libc",
  "reqwest",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-util",

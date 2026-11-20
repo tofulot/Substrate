@@ -1,6 +1,7 @@
 use agent_protocol::Preview;
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     path::{Component, Path, PathBuf},
     process::Stdio,
@@ -13,7 +14,9 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 mod npm;
+mod verification;
 pub use npm::{npm_start_script, verify_npm_app};
+pub use verification::IsolatedChecks;
 
 pub fn is_shell_tool(name: &str) -> bool {
     matches!(name, "execute_command" | "run_check")
@@ -71,6 +74,54 @@ pub async fn read(root: &Path, path: &str) -> Result<String> {
     tokio::fs::read_to_string(file)
         .await
         .context("Cannot read file as UTF-8")
+}
+async fn read_for_model(root: &Path, args: &Value) -> Result<Value> {
+    let path = string(args, "path")?;
+    let content = read(root, path).await?;
+    if args.get("start_line").is_none() && args.get("end_line").is_none() {
+        return Ok(json!({"content":content}));
+    }
+    let start = args["start_line"].as_u64().unwrap_or(1) as usize;
+    let end = args["end_line"]
+        .as_u64()
+        .map_or(start + 199, |line| line as usize);
+    ensure!(
+        start <= end && end - start < 200,
+        "Request at most 200 lines"
+    );
+    let total = content.lines().count();
+    ensure!(
+        start <= total,
+        "Start line is beyond the end of the file ({total} lines)"
+    );
+    let mut excerpt = String::new();
+    let mut lines = 0;
+    for line in content
+        .split_inclusive('\n')
+        .skip(start - 1)
+        .take(end - start + 1)
+    {
+        let remaining = (24 * 1024usize).saturating_sub(excerpt.len());
+        if line.len() > remaining {
+            if lines == 0 {
+                let boundary = line.floor_char_boundary(remaining);
+                return Ok(
+                    json!({"path":path,"content":&line[..boundary],"start_line":start,
+                    "end_line":start,"total_lines":total,"truncated_line":true,
+                    "next_line":(start < total).then_some(start + 1),
+                    "sha256":format!("{:x}",Sha256::digest(content.as_bytes()))}),
+                );
+            }
+            break;
+        }
+        excerpt.push_str(line);
+        lines += 1;
+    }
+    Ok(
+        json!({"path":path,"content":excerpt,"start_line":start,"end_line":start + lines - 1,
+        "total_lines":total,"next_line":(start + lines <= total).then_some(start + lines),
+        "sha256":format!("{:x}",Sha256::digest(content.as_bytes()))}),
+    )
 }
 pub async fn entries(root: &Path, path: &str) -> Result<Value> {
     let dir = if path.is_empty() {
@@ -202,11 +253,16 @@ pub async fn command(
     cancel: &CancellationToken,
     output: mpsc::Sender<String>,
 ) -> Result<Value> {
+    let mut cmd = shell(script)?;
+    run_command(root, &mut cmd, cancel, output).await
+}
+
+fn shell(script: &str) -> Result<Command> {
     ensure!(
         !script.trim().is_empty() && script.len() < 16_000,
         "Invalid command"
     );
-    let mut cmd = if cfg!(windows) {
+    Ok(if cfg!(windows) {
         let mut c = Command::new("cmd.exe");
         c.args(["/D", "/S", "/C", script]);
         c
@@ -214,8 +270,16 @@ pub async fn command(
         let mut c = Command::new("/bin/sh");
         c.args(["-c", script]);
         c
-    };
-    let (mut child, group, stdout, stderr) = spawn_command(root, &mut cmd, output)?;
+    })
+}
+
+async fn run_command(
+    root: &Path,
+    cmd: &mut Command,
+    cancel: &CancellationToken,
+    output: mpsc::Sender<String>,
+) -> Result<Value> {
+    let (mut child, group, stdout, stderr) = spawn_command(root, cmd, output)?;
     let exit = tokio::select! {
         _=cancel.cancelled()=>Err(anyhow::anyhow!("Command cancelled")),
         result=tokio::time::timeout(Duration::from_secs(120),child.wait())=>match result {
@@ -312,8 +376,8 @@ pub fn definitions() -> Vec<Value> {
     let defs = [
         (
             "read_file",
-            "Read a UTF-8 file inside the workspace.",
-            json!({"path":{"type":"string"}}),
+            "Read a UTF-8 workspace file. Prefer a line range around a symbol or search match. With no range, reads the whole file.",
+            json!({"path":{"type":"string"},"start_line":{"type":"integer","minimum":1,"maximum":524288,"description":"First line, inclusive and 1-based; defaults to 1 when end_line is supplied."},"end_line":{"type":"integer","minimum":1,"maximum":524288,"description":"Last line, inclusive. At most 200 lines; a start without an end reads up to 200 lines."}}),
         ),
         (
             "list_files",
@@ -322,8 +386,8 @@ pub fn definitions() -> Vec<Value> {
         ),
         (
             "search_repository",
-            "Search repository content with ripgrep; returns bounded matching lines.",
-            json!({"query":{"type":"string"}}),
+            "Find text in the workspace. Use literal search for names and source text, and regex mode for patterns. Scope to a file or directory when possible.",
+            json!({"query":{"type":"string"},"path":{"type":"string","description":"Optional workspace-relative file or directory. Defaults to the workspace root."},"mode":{"type":"string","enum":["literal","regex"],"description":"Defaults to literal."},"context_lines":{"type":"integer","minimum":0,"maximum":5,"description":"Lines to show on either side of each match. Defaults to zero."}}),
         ),
         (
             "apply_patch",
@@ -337,8 +401,8 @@ pub fn definitions() -> Vec<Value> {
         ),
         (
             "run_check",
-            "Run a targeted test, smoke check, or project test suite against the current workspace. State the behavior or failure case it checks. Use a command whose exit status reflects the assertions, and do not edit source in this command. Requires approval. 120 second timeout.",
-            json!({"command":{"type":"string"},"purpose":{"type":"string"}}),
+            "Run a targeted test or reproduction. State the behavior it checks. Use kind probe for exploratory checks that may deliberately fail, or verification for a check that must pass. A required command always counts as verification. Requires approval. 120 second timeout.",
+            json!({"command":{"type":"string"},"purpose":{"type":"string"},"kind":{"type":"string","enum":["probe","verification"]}}),
         ),
         (
             "verify_npm_app",
@@ -352,9 +416,21 @@ pub fn definitions() -> Vec<Value> {
         ),
     ];
     defs.into_iter().map(|(name,description,properties)| {
-        let required:Vec<_>=properties.as_object().unwrap().keys().cloned().collect();
+        let required: Vec<_> = match name {
+            "read_file" => vec!["path"],
+            "search_repository" => vec!["query"],
+            "run_check" => vec!["command", "purpose"],
+            _ => properties.as_object().unwrap().keys().map(String::as_str).collect(),
+        };
         json!({"type":"function","name":name,"description":description,"strict":true,"parameters":{"type":"object","properties":properties,"required":required,"additionalProperties":false}})
     }).collect()
+}
+
+pub fn available_in_isolated_checks(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file" | "list_files" | "search_repository" | "apply_patch" | "run_check" | "git_diff"
+    )
 }
 pub fn validate(name: &str, args: &Value) -> Result<()> {
     let defs = definitions();
@@ -367,13 +443,42 @@ pub fn validate(name: &str, args: &Value) -> Result<()> {
         .context("Tool arguments must be an object")?;
     let props = def["parameters"]["properties"].as_object().unwrap();
     ensure!(
-        obj.len() == props.len()
-            && props
-                .keys()
-                .all(|k| obj.get(k).is_some_and(Value::is_string)),
+        def["parameters"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|key| obj.contains_key(key.as_str().unwrap()))
+            && obj
+                .iter()
+                .all(|(key, value)| props.get(key).is_some_and(|schema| {
+                    if schema["type"] == "integer" {
+                        value.as_u64().is_some_and(|n| {
+                            n >= schema["minimum"].as_u64().unwrap()
+                                && n <= schema["maximum"].as_u64().unwrap()
+                        })
+                    } else {
+                        value.is_string()
+                            && schema["enum"]
+                                .as_array()
+                                .is_none_or(|values| values.contains(value))
+                    }
+                })),
         "Tool arguments do not match schema"
     );
     if name == "run_check" {
+        let command = string(args, "command")?;
+        let command = command
+            .trim()
+            .trim_end_matches(';')
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        ensure!(
+            !matches!(
+                command.as_slice(),
+                [] | ["true" | "/bin/true" | "/usr/bin/true" | ":"] | ["exit", "0"]
+            ),
+            "A check must exercise the workspace or validate an observable result"
+        );
         let purpose = string(args, "purpose")?;
         ensure!(
             !purpose.trim().is_empty() && purpose.len() <= 512,
@@ -391,7 +496,7 @@ pub async fn execute(
 ) -> Result<Value> {
     validate(name, args)?;
     match name {
-        "read_file" => Ok(json!({"content":read(root,string(args,"path")?).await?})),
+        "read_file" => read_for_model(root, args).await,
         "list_files" => entries(root, string(args, "path")?).await,
         "git_diff" => Ok(json!(
             git(
@@ -405,10 +510,34 @@ pub async fn execute(
         }
         "verify_npm_app" => verify_npm_app(root, cancel, output).await,
         "search_repository" => {
+            let path = args["path"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(".");
+            let scoped = resolve(root, path)?.canonicalize()?;
+            let scoped = scoped.strip_prefix(root)?;
+            ensure!(
+                !Path::new(path)
+                    .components()
+                    .chain(scoped.components())
+                    .any(|part| {
+                        let name = part.as_os_str().to_string_lossy().to_ascii_lowercase();
+                        name == ".git" || name.starts_with(".env") || name.ends_with(".pem")
+                    }),
+                "Search path is excluded"
+            );
+            let context = args["context_lines"].as_u64().unwrap_or(0).to_string();
+            let mode = if args["mode"] == "regex" {
+                "--no-fixed-strings"
+            } else {
+                "--fixed-strings"
+            };
             let result = tokio::time::timeout(
                 Duration::from_secs(15),
                 Command::new(std::env::var_os("SUBSTRATE_RG").unwrap_or_else(|| "rg".into()))
                     .args([
+                        "--no-config",
+                        "--with-filename",
                         "--line-number",
                         "--no-heading",
                         "--color",
@@ -421,10 +550,13 @@ pub async fn execute(
                         "!.env*",
                         "--glob",
                         "!*.pem",
+                        mode,
+                        "--context",
+                        &context,
                         "--",
                         string(args, "query")?,
-                        ".",
                     ])
+                    .arg(Path::new(".").join(scoped))
                     .current_dir(root)
                     .kill_on_drop(true)
                     .output(),
@@ -462,6 +594,9 @@ mod tests {
         }
         assert!(validate("read_file", &json!({"path":"a","extra":1})).is_err());
         assert!(validate("execute_command", &json!({"command":1})).is_err());
+        for command in ["true", ":", "exit 0"] {
+            assert!(validate("run_check", &json!({"command":command,"purpose":"verify"})).is_err());
+        }
         std::fs::remove_dir_all(p).unwrap();
     }
     #[tokio::test]

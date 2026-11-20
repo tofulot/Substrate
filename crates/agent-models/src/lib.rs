@@ -1,3 +1,6 @@
+mod codex;
+pub use codex::Codex;
+
 use agent_protocol::{ModelMetrics, TokenUsage};
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
@@ -16,10 +19,32 @@ pub struct DecisionResponse {
 }
 
 pub const BASE_URL: &str = "https://api.subq.ai/v1";
-pub const DEFAULT_MODEL: &str = "subq-preview";
-pub const DECISION_MODEL: &str = "subq-snap-1.1";
+pub const DEFAULT_MODEL: &str = "subq-savant-1.4";
+const REASONING_EFFORT: &str = "medium";
+const SUBQ_OUTPUT_BUDGET: u32 = 65_536;
+
+pub const DECISION_MODEL: &str = "subq-snap-1.2";
+
+pub fn current_model(model: &str) -> &str {
+    match model {
+        "subq-preview" | "subq-1p2-medium" => DEFAULT_MODEL,
+        model => model,
+    }
+}
+
+pub struct ModelRequest<'a> {
+    pub model: &'a str,
+    pub instructions: &'a str,
+    pub input: &'a [Value],
+    pub tools: Vec<Value>,
+    pub review: bool,
+}
+
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
+    fn supports_review(&self) -> bool {
+        false
+    }
     async fn decide(
         &self,
         _state: Value,
@@ -33,10 +58,7 @@ pub trait ModelProvider: Send + Sync {
     }
     async fn respond(
         &self,
-        model: &str,
-        instructions: &str,
-        input: &[Value],
-        tools: Vec<Value>,
+        request: ModelRequest<'_>,
         cancel: &CancellationToken,
         deltas: mpsc::Sender<String>,
     ) -> ModelResponse;
@@ -188,6 +210,9 @@ fn chat_messages(instructions: &str, input: &[Value]) -> Vec<Value> {
 }
 #[async_trait]
 impl ModelProvider for Subquadratic {
+    fn supports_review(&self) -> bool {
+        true
+    }
     async fn decide(
         &self,
         state: Value,
@@ -202,27 +227,22 @@ impl ModelProvider for Subquadratic {
     }
     async fn respond(
         &self,
-        model: &str,
-        instructions: &str,
-        input: &[Value],
-        tools: Vec<Value>,
+        request: ModelRequest<'_>,
         cancel: &CancellationToken,
         deltas: mpsc::Sender<String>,
     ) -> ModelResponse {
         let start = Instant::now();
         let mut metrics = ModelMetrics::default();
-        let output = self
-            .stream(
-                model,
-                instructions,
-                input,
-                tools,
-                cancel,
-                deltas,
-                &mut metrics,
-                start,
-            )
-            .await;
+        let review = request.review;
+        let stream = self.stream(request, cancel, deltas, &mut metrics, start);
+        let output = if review {
+            match tokio::time::timeout(std::time::Duration::from_secs(90), stream).await {
+                Ok(output) => output,
+                Err(_) => Err(anyhow::anyhow!("SubQ review timed out")),
+            }
+        } else {
+            stream.await
+        };
         metrics.duration_ms = Some(start.elapsed().as_millis() as u64);
         ModelResponse { output, metrics }
     }
@@ -290,13 +310,9 @@ impl Subquadratic {
         ensure!(response["answers"].is_object(), "Missing Snap answers");
         Ok(response["answers"].clone())
     }
-    #[allow(clippy::too_many_arguments)]
     async fn stream(
         &self,
-        model: &str,
-        instructions: &str,
-        input: &[Value],
-        tools: Vec<Value>,
+        request: ModelRequest<'_>,
         cancel: &CancellationToken,
         deltas: mpsc::Sender<String>,
         metrics: &mut ModelMetrics,
@@ -306,6 +322,13 @@ impl Subquadratic {
             !self.key.is_empty(),
             "Add your Subquadratic API key in Settings"
         );
+        let ModelRequest {
+            model,
+            instructions,
+            input,
+            tools,
+            review,
+        } = request;
         let tools: Vec<_> = tools
             .into_iter()
             .map(|mut t| {
@@ -313,8 +336,10 @@ impl Subquadratic {
                 json!({"type":"function","function":t})
             })
             .collect();
+        let effort = if review { "max" } else { REASONING_EFFORT };
+        metrics.reasoning_effort = Some(effort.into());
         let payload = serde_json::to_vec(
-            &json!({"model":model,"messages":chat_messages(instructions,input),"tools":tools,"stream":true,"store":false,"max_tokens":16384,"reasoning_effort":"medium"}),
+            &json!({"model":model,"messages":chat_messages(instructions,input),"tools":tools,"stream":true,"store":false,"max_tokens":SUBQ_OUTPUT_BUDGET,"reasoning_effort":effort}),
         )?;
         metrics.request_bytes = Some(payload.len() as u64);
         let request = self
@@ -333,7 +358,7 @@ impl Subquadratic {
                 status.as_u16(),
                 match status.as_u16() {
                     401 => "Check your API key.",
-                    403 => "SubQ Preview requires early-access permission for your organization.",
+                    403 => "SubQ Savant requires early-access permission for your organization.",
                     429 => "Rate limit or quota reached; try again later.",
                     _ => "Check provider availability and your model configuration.",
                 }

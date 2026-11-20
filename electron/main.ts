@@ -40,6 +40,7 @@ const allowed = new Set([
   "session.list",
   "session.resume",
   "agent.start",
+  "agent.set_approval_mode",
   "agent.interrupt",
   "session.cancel",
   "tool.approve",

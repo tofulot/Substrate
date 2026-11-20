@@ -22,7 +22,7 @@ impl Request {
         Ok(request)
     }
 }
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalMode {
     #[default]
@@ -105,7 +105,11 @@ pub struct ModelMetrics {
     pub duration_ms: Option<u64>,
     pub first_output_ms: Option<u64>,
     pub http_status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_retries: Option<u64>,
     pub finish_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     pub usage: Option<TokenUsage>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -122,6 +126,9 @@ pub struct CallTrace {
     pub context_revision: u64,
     pub context_bytes: u64,
     pub history_bytes: u64,
+    /// Original serialized size when the provider received a bounded transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_stored_bytes: Option<u64>,
     /// UTF-8 bytes / 4 heuristic; not a tokenizer count, capacity limit, or bill.
     pub estimated_input_tokens: Option<u64>,
     pub tool_calls: u64,
@@ -161,6 +168,13 @@ pub struct FileVersion {
     pub path: String,
     pub hash: String,
     pub bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excerpt: Option<LineRange>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LineRange {
+    pub start_line: usize,
+    pub end_line: usize,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExcludedPath {
@@ -189,6 +203,8 @@ pub struct ContextSnapshot {
     pub scanned_files: u64,
     pub truncated: bool,
     pub files: Vec<FileVersion>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub snippet_packing: bool,
     pub excluded: Vec<ExcludedPath>,
     pub changes: Vec<ContextChange>,
     #[serde(default)]
@@ -215,4 +231,10 @@ pub struct FileRank {
     pub score: f64,
     pub confidence: Option<f64>,
     pub source: String,
+    #[serde(default)]
+    pub local_rank: Option<u64>,
+    #[serde(default)]
+    pub snap_candidate: bool,
+    #[serde(default)]
+    pub context_stage: Option<String>,
 }

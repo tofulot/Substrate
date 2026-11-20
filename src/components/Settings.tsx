@@ -4,24 +4,38 @@ import { Check, KeyRound, LockKeyhole, Loader2, X } from "lucide-react";
 import { api, useStore } from "../lib/store";
 import { Button } from "./ui/button";
 import type { Config } from "../../shared/types";
+
+const DEFAULT_MODEL_TURNS = 64;
+const MAX_MODEL_TURNS = 128;
+
 export default function Settings() {
   const open = useStore((s) => s.settings);
   const config = useStore((s) => s.config);
   const [key, setKey] = useState("");
-  const [model, setModel] = useState("subq-preview");
+  const [model, setModel] = useState("subq-savant-1.4");
   const [budget, setBudget] = useState(512 * 1024);
+  const [turnLimit, setTurnLimit] = useState(String(DEFAULT_MODEL_TURNS));
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("");
   const [error, setError] = useState("");
   useEffect(() => {
     if (open) {
-      setModel(config?.model || "subq-preview");
+      setModel(config?.model || "subq-savant-1.4");
       setBudget(config?.context_budget_bytes || 512 * 1024);
+      setTurnLimit(String(config?.max_steps ?? DEFAULT_MODEL_TURNS));
       setStatus("");
       setError("");
-    } else setKey("");
-  }, [open, config?.model, config?.context_budget_bytes]);
+    } else {
+      setKey("");
+    }
+  }, [open, config?.model, config?.context_budget_bytes, config?.max_steps]);
   async function save() {
+    const turns = Number(turnLimit);
+    if (!Number.isInteger(turns) || turns < 1 || turns > MAX_MODEL_TURNS) {
+      setStatus("");
+      setError("Enter a model turn limit from 1 to 128.");
+      return;
+    }
     setBusy(true);
     setError("");
     setStatus("");
@@ -32,7 +46,7 @@ export default function Settings() {
       }
       await api.rpc("config.update", {
         model,
-        max_steps: config?.max_steps ?? 20,
+        max_steps: turns,
         context_budget_bytes: budget,
       });
       const next = await api.rpc<Config>("config.get");
@@ -57,9 +71,24 @@ export default function Settings() {
       const models = await api.rpc<{ id: string }[]>("models.list");
       if (!models.some((m) => m.id === model))
         throw new Error(
-          `${model} is not available to this key. SubQ Preview needs early-access permission.`,
+          `${model} is not available to this key. SubQ Savant needs early-access permission.`,
         );
       setStatus(`Connected · ${model} is available`);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function removeKey() {
+    setBusy(true);
+    setError("");
+    setStatus("");
+    try {
+      await api.setApiKey("");
+      setKey("");
+      useStore.setState({ config: await api.rpc<Config>("config.get") });
+      setStatus("Saved key removed");
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -72,7 +101,7 @@ export default function Settings() {
       onOpenChange={(settings) => {
         useStore.setState({ settings });
         if (settings) {
-          setModel(config?.model || "subq-preview");
+          setModel(config?.model || "subq-savant-1.4");
           setStatus("");
           setError("");
         }
@@ -132,10 +161,10 @@ export default function Settings() {
             value={model}
             onChange={(e) => setModel(e.target.value)}
           >
-            <option value="subq-preview">SubQ Preview</option>
+            <option value="subq-savant-1.4">SubQ Savant 1.4</option>
           </select>
           <p className="field-help">
-            Preview supports generation and tools. Organization early access is
+            Savant supports generation and tools. Organization early access is
             required. Snap ranks repository files for each task.
           </p>
           <label htmlFor="context-budget">Repository context budget</label>
@@ -152,8 +181,22 @@ export default function Settings() {
           </select>
           <p className="field-help">
             Tasks and eligible file excerpts go to Snap for selection; selected
-            source goes to Preview. Sensitive and ignored paths are excluded.
-            This byte budget is separate from the 360 KB history cap.
+            source goes to Savant. Sensitive and ignored paths are excluded.
+            Conversation history has its own budget.
+          </p>
+          <label htmlFor="model-turn-limit">Model turns per task</label>
+          <input
+            id="model-turn-limit"
+            type="number"
+            min={1}
+            max={MAX_MODEL_TURNS}
+            step={1}
+            value={turnLimit}
+            onChange={(event) => setTurnLimit(event.target.value)}
+            aria-describedby="model-turn-limit-help"
+          />
+          <p className="field-help" id="model-turn-limit-help">
+            Applies to new tasks. The default is {DEFAULT_MODEL_TURNS} turns.
           </p>
           <div className="permission-note">
             <strong>You're in control</strong>
@@ -189,17 +232,8 @@ export default function Settings() {
           {config?.has_key && (
             <button
               className="text-button remove-key"
-              onClick={() => {
-                void api
-                  .setApiKey("")
-                  .then(async () => {
-                    useStore.setState({
-                      config: await api.rpc<Config>("config.get"),
-                    });
-                    setStatus("Saved key removed");
-                  })
-                  .catch((e) => setError(e.message));
-              }}
+              onClick={() => void removeKey()}
+              disabled={busy}
             >
               Remove saved key
             </button>
