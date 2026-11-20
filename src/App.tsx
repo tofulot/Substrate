@@ -2,13 +2,11 @@ import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import {
   Activity,
-  ArrowDown,
   ArrowRight,
   ArrowUp,
   Check,
   ChevronDown,
   ChevronRight,
-  Circle,
   CircleDot,
   Code2,
   Command,

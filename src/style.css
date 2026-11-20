@@ -10,10 +10,6 @@
   -webkit-font-smoothing: antialiased;
   font-size: 13px;
   font-weight: 400;
-  --line: #e3e5dc;
-  --muted: #92978a;
-  --green: #586341;
-  --accent: #c4d193;
   --canvas: #fafaf7;
 }
 * {
@@ -1333,18 +1329,10 @@ select:focus {
 .button-outline:hover {
   background: #edf3e2;
 }
-.button-ghost {
-  background: transparent;
-  color: #879872;
-}
 .button-small {
   height: 29px;
   font-size: 10px;
   padding: 0 10px;
-}
-.button-icon {
-  width: 30px;
-  padding: 0;
 }
 .modal-overlay {
   position: fixed;
