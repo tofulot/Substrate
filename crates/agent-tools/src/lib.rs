@@ -15,8 +15,10 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 mod npm;
 mod verification;
+mod web;
 pub use npm::{npm_start_script, verify_npm_app};
 pub use verification::IsolatedChecks;
+pub use web::WebTools;
 
 pub fn is_shell_tool(name: &str) -> bool {
     matches!(name, "execute_command" | "run_check")
@@ -310,7 +312,12 @@ fn spawn_command(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     // Credentials must never leak into tool subprocesses.
-    for name in ["SUBQ_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"] {
+    for name in [
+        "SUBQ_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "BRAVE_SEARCH_API_KEY",
+    ] {
         cmd.env_remove(name);
     }
     #[cfg(unix)]
@@ -337,6 +344,7 @@ pub async fn git(root: &Path, args: &[&str]) -> Result<String> {
             .args(args)
             .current_dir(root)
             .env("GIT_PAGER", "cat")
+            .env_remove("BRAVE_SEARCH_API_KEY")
             .kill_on_drop(true)
             .output(),
     )
@@ -388,6 +396,16 @@ pub fn definitions() -> Vec<Value> {
             "search_repository",
             "Find text in the workspace. Use literal search for names and source text, and regex mode for patterns. Scope to a file or directory when possible.",
             json!({"query":{"type":"string"},"path":{"type":"string","description":"Optional workspace-relative file or directory. Defaults to the workspace root."},"mode":{"type":"string","enum":["literal","regex"],"description":"Defaults to literal."},"context_lines":{"type":"integer","minimum":0,"maximum":5,"description":"Lines to show on either side of each match. Defaults to zero."}}),
+        ),
+        (
+            "web_search",
+            "Search the public web with Brave Search. Returns ranked source URLs, titles, and snippets. Requires a Brave Search API key in Settings or BRAVE_SEARCH_API_KEY.",
+            json!({"query":{"type":"string"}}),
+        ),
+        (
+            "fetch_url",
+            "Fetch a public HTTP(S) page or text/JSON endpoint now. Returns readable text, its final URL, and retrieval time for citation.",
+            json!({"url":{"type":"string"}}),
         ),
         (
             "apply_patch",
@@ -491,6 +509,7 @@ pub async fn execute(
     root: &Path,
     name: &str,
     args: &Value,
+    web: &WebTools,
     cancel: &CancellationToken,
     output: mpsc::Sender<String>,
 ) -> Result<Value> {
@@ -498,6 +517,8 @@ pub async fn execute(
     match name {
         "read_file" => read_for_model(root, args).await,
         "list_files" => entries(root, string(args, "path")?).await,
+        "web_search" => web.search(string(args, "query")?, cancel).await,
+        "fetch_url" => web.fetch(string(args, "url")?, cancel).await,
         "git_diff" => Ok(json!(
             git(
                 root,
@@ -558,6 +579,7 @@ pub async fn execute(
                     ])
                     .arg(Path::new(".").join(scoped))
                     .current_dir(root)
+                    .env_remove("BRAVE_SEARCH_API_KEY")
                     .kill_on_drop(true)
                     .output(),
             )

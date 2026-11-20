@@ -65,6 +65,8 @@ const toolNames: Record<string, string> = {
   read_file: "Read file",
   list_files: "Explore files",
   search_repository: "Search repository",
+  web_search: "Search the web",
+  fetch_url: "Fetch web page",
   apply_patch: "Edit file",
   execute_command: "Run command",
   run_check: "Run verification check",
@@ -104,6 +106,7 @@ function ToolCard({
           {String(
             tool.arguments.path ||
               tool.arguments.query ||
+              tool.arguments.url ||
               tool.arguments.command ||
               "",
           ).slice(0, 75)}
@@ -862,11 +865,22 @@ export default function App() {
                         <div className="markdown">
                           <Markdown
                             components={{
-                              a: ({ children }) => (
-                                <span className="disabled-link">
-                                  {children}
-                                </span>
-                              ),
+                              a: ({ href, children }) =>
+                                href && /^https?:\/\//iu.test(href) ? (
+                                  <a
+                                    href={href}
+                                    onClick={(event) => {
+                                      event.preventDefault();
+                                      void api
+                                        .openLink(href)
+                                        .catch(useStore.getState().setError);
+                                    }}
+                                  >
+                                    {children}
+                                  </a>
+                                ) : (
+                                  <span>{children}</span>
+                                ),
                             }}
                           >
                             {message.content}

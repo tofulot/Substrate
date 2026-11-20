@@ -21,9 +21,10 @@ The transport is UTF-8, newline-delimited JSON-RPC 2.0 over stdin/stdout. Each r
 | `agent.interrupt`, `session.cancel` | `session_id` | cancellation acknowledgment |
 | `tool.approve`, `tool.reject` | `session_id`, `tool_id` | approval acknowledgment |
 | `models.list` | none | model objects available to the current key |
-| `config.get` | none | model, max_steps, context_budget_bytes, has_key |
+| `config.get` | none | model, max_steps, context_budget_bytes, has_key, has_search_key |
 | `config.update` | `model`, optional `max_steps` (1–128 model turns, 64 by default), `context_budget_bytes` (32 KiB–4 MiB) | save non-secret configuration |
 | `config.credentials` | `key` | in-memory credential update; main-process-only, excluded from renderer allowlist |
+| `config.web_search_credentials` | `key` | in-memory Brave Search credential update, excluded from renderer allowlist |
 | `context.get` | `session_id`, optional `snapshot_id` | manifest, current workspace freshness, changed paths, check time; no source bodies |
 | `context.refresh` | `session_id` | capture current source when idle; automatic between agent model turns |
 | `context.history` | `session_id` | latest 30 snapshot summaries |
@@ -71,6 +72,13 @@ In the approved profile on macOS and Linux, a run that adds a root `package.json
 In `approve_edits`, validated `apply_patch` calls emit `tool.started` and `tool.completed` with the patch preview. Switching a running task to `approve_edits` also releases a patch awaiting approval. Shell commands require approval in both modes.
 
 Parse/envelope failures use `-32700`; method/validation/runtime failures use `-32000`. Provider errors expose a sanitized status and remediation text, rather than echoing upstream response bodies or credentials.
+
+### Web retrieval tools
+
+- `web_search({query})` returns `query`, `provider`, `retrieved_at`, and up to eight `results` containing `url`, `title`, and `snippet`. It requires a Brave Search key. Indexed snippets can predate the retrieval timestamp.
+- `fetch_url({url})` returns `url` after redirects, an optional `title`, `retrieved_at`, `text`, and `truncated`. It accepts public HTTP(S) URLs on standard ports and reads HTML, text, JSON, or XML. It returns up to 24 KiB of UTF-8 text.
+
+Both tools use a 20-second deadline and read at most 1 MiB per response. Fetches validate each redirect and filter DNS results before connecting. Retrieval timestamps use UTC in RFC 3339 format. The agent receives the tool results as untrusted input and is instructed to cite the returned URLs.
 
 ## Context and trace semantics
 

@@ -5,6 +5,7 @@ import {
   ipcMain,
   Menu,
   safeStorage,
+  shell,
 } from "electron";
 import {
   execFile,
@@ -31,6 +32,13 @@ const pending = new Map<
     timer: NodeJS.Timeout;
   }
 >();
+const credentials = {
+  subq: { file: "subq-key.enc", method: "config.credentials" },
+  search: {
+    file: "brave-search-key.enc",
+    method: "config.web_search_credentials",
+  },
+} as const;
 const allowed = new Set([
   "ping",
   "config.get",
@@ -241,17 +249,17 @@ async function startAgent() {
     offline("Rust harness stopped. Restart Substrate to reconnect.");
   });
   await rpc("ping");
-  try {
-    const encrypted = await fs.readFile(
-      join(app.getPath("userData"), "subq-key.enc"),
-    );
-    if (await safeStorage.isAsyncEncryptionAvailable()) {
-      const { result: key } = await safeStorage.decryptStringAsync(encrypted);
-      await rpc("config.credentials", { key });
+  for (const { file, method } of Object.values(credentials)) {
+    try {
+      const encrypted = await fs.readFile(join(app.getPath("userData"), file));
+      if (await safeStorage.isAsyncEncryptionAvailable()) {
+        const { result: key } = await safeStorage.decryptStringAsync(encrypted);
+        await rpc(method, { key });
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT")
+        console.error("Could not restore a saved credential");
     }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT")
-      console.error("Could not restore the saved credential");
   }
 }
 function validateSender(event: Electron.IpcMainInvokeEvent) {
@@ -310,29 +318,50 @@ ipcMain.handle("project:create", async (event, input: unknown) => {
   }
   return rpc("project.open", { path });
 });
-ipcMain.handle("credentials:set", async (event, key: unknown) => {
+ipcMain.handle(
+  "credentials:set",
+  async (event, provider: unknown, input: unknown) => {
+    validateSender(event);
+    await ready;
+    if (provider !== "subq" && provider !== "search")
+      throw new Error("Unknown credential provider");
+    if (typeof input !== "string" || input.length >= 8192)
+      throw new Error("Invalid API key");
+    const key = input.trim();
+    if (provider === "search" && !/^[\x21-\x7e]*$/u.test(key))
+      throw new Error("Invalid Brave Search API key");
+    const { file, method } = credentials[provider];
+    const path = join(app.getPath("userData"), file);
+    if (key) {
+      if (
+        !(await safeStorage.isAsyncEncryptionAvailable()) ||
+        (process.platform === "linux" &&
+          safeStorage.getSelectedStorageBackend() === "basic_text")
+      )
+        throw new Error("OS credential encryption is unavailable");
+      const encrypted = await safeStorage.encryptStringAsync(key);
+      await fs.mkdir(app.getPath("userData"), { recursive: true });
+      await fs.writeFile(path, encrypted, { mode: 0o600 });
+    } else {
+      await fs.rm(path, { force: true });
+    }
+    await rpc(method, { key });
+  },
+);
+ipcMain.handle("link:open", async (event, input: unknown) => {
   validateSender(event);
-  await ready;
-  if (typeof key !== "string" || key.length > 8192)
-    throw new Error("Invalid API key");
-  if (key) {
-    if (
-      !(await safeStorage.isAsyncEncryptionAvailable()) ||
-      (process.platform === "linux" &&
-        safeStorage.getSelectedStorageBackend() === "basic_text")
-    )
-      throw new Error("OS credential encryption is unavailable");
-    const encrypted = await safeStorage.encryptStringAsync(key.trim());
-    await fs.mkdir(app.getPath("userData"), { recursive: true });
-    await fs.writeFile(
-      join(app.getPath("userData"), "subq-key.enc"),
-      encrypted,
-      { mode: 0o600 },
+  if (typeof input !== "string" || input.length > 4096 || !URL.canParse(input))
+    throw new Error("Invalid link");
+  const url = new URL(input);
+  if (
+    !["http:", "https:"].includes(url.protocol) ||
+    url.username ||
+    url.password
+  )
+    throw new Error(
+      "Only HTTP and HTTPS links without credentials can be opened",
     );
-  } else {
-    await fs.rm(join(app.getPath("userData"), "subq-key.enc"), { force: true });
-  }
-  await rpc("config.credentials", { key: key.trim() });
+  await shell.openExternal(url.href);
 });
 function createWindow() {
   window = new BrowserWindow({

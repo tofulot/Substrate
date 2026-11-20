@@ -158,6 +158,18 @@ class Model(BaseHTTPRequestHandler):
                 assert not evidence['verification_pending']
                 assert evidence['recent_checks'][-1]['kind'] == 'probe'
                 events = [{"choices": [{"delta": {"content": "Verified in isolation."}}]}]
+        elif task == 'web_tools_unavailable':
+            tools = {tool['function']['name'] for tool in body['tools']}
+            assert 'fetch_url' in tools and 'web_search' not in tools
+            assert 'Cite web-derived claims with Markdown links' in messages[0]['content']
+            if not outputs:
+                events = call('web_search', {'query': 'Public release notes'})
+                events += call('fetch_url', {'url': 'http://127.0.0.1/'}, 1)
+            else:
+                errors = [json.loads(output['content'])['error'] for output in outputs]
+                assert 'requires a Brave Search API key' in errors[0]
+                assert 'public website' in errors[1]
+                events = [{"choices": [{"delta": {"content": "Live sources could not be retrieved."}}]}]
         elif task == 'provider_error':
             self.send_response(403); self.end_headers(); self.wfile.write(b'do-not-store-this-provider-body'); return
         elif task == 'verify_behavior':
@@ -542,6 +554,18 @@ def main():
         assert [call['metrics']['reasoning_effort'] for call in calls] == [
             'medium', 'medium', 'medium', 'max', 'medium']
         assert calls[-2]['status'] == 'failed' and calls[-1]['status'] == 'completed'
+        web_session = client.rpc('session.create', project=str(repo))['id']
+        client.rpc('config.web_search_credentials', key='test-search-key')
+        search_config = client.rpc('config.get')
+        assert search_config['has_search_key'] and 'test-search-key' not in json.dumps(search_config)
+        client.rpc('config.web_search_credentials', key='')
+        client.rpc('agent.start', session_id=web_session, task='web_tools_unavailable', context_selection='local')
+        client.wait('agent.completed', lambda p: p['session_id'] == web_session)
+        web_messages = client.rpc('session.resume', session_id=web_session)['messages']
+        assert web_messages[-1]['content'] == 'Live sources could not be retrieved.'
+        assert [(m['tool']['name'], m['tool']['status']) for m in web_messages if 'tool' in m] == [
+            ('web_search', 'failed'), ('fetch_url', 'failed'),
+        ]
         # Provider failures and interrupted streams are traced without fabricated token counts.
         failed = client.rpc('session.create', project=str(repo))['id']
         client.rpc('agent.start', session_id=failed, task='provider_error'); client.wait('agent.failed')
