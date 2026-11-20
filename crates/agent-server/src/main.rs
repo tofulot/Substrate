@@ -1,14 +1,18 @@
 use agent_protocol::{Request, failure, success};
-use agent_runtime::Runtime;
+use agent_runtime::{Job, Runtime};
 use agent_storage::Storage;
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{path::PathBuf, sync::Arc};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    sync::{Mutex, mpsc},
+    sync::{Mutex, mpsc, watch},
 };
 use tokio_util::sync::CancellationToken;
+
+const DEFAULT_MAX_STEPS: u64 = 64;
+const MAX_MAX_STEPS: u64 = 128;
+
 struct Config {
     key: String,
     model: String,
@@ -47,13 +51,16 @@ impl Server {
                 Ok(json!(true))
             }
             "config.update" => {
-                let model = str_arg(p, "model")?;
+                let model = agent_models::current_model(str_arg(p, "model")?);
                 ensure!(
                     model.starts_with("subq-") && !model.contains("snap") && model.len() < 120,
                     "Select a SubQ generative model; Snap uses a separate Decisions API"
                 );
-                let max_steps = p["max_steps"].as_u64().unwrap_or(20).clamp(1, 50) as usize;
                 let mut c = self.config.lock().await;
+                let max_steps = p["max_steps"]
+                    .as_u64()
+                    .unwrap_or(c.max_steps as u64)
+                    .clamp(1, MAX_MAX_STEPS) as usize;
                 let budget = p["context_budget_bytes"]
                     .as_u64()
                     .unwrap_or(c.context_budget_bytes as u64) as usize;
@@ -139,6 +146,7 @@ impl Server {
                 let prior = snapshot.clone();
                 let budget = self.config.lock().await.context_budget_bytes;
                 let session_id = session.id.clone();
+                let task = agent_core::selection_task(&session);
                 let current = tokio::task::spawn_blocking(move || {
                     agent_context::scan(
                         &root,
@@ -147,6 +155,7 @@ impl Server {
                         Some(&prior),
                         head,
                         &CancellationToken::new(),
+                        &task,
                     )
                 })
                 .await??;
@@ -170,9 +179,13 @@ impl Server {
             "session.list" => Ok(serde_json::to_value(self.storage.list().await?)?),
             "session.resume" => {
                 let session = self.storage.get(str_arg(p, "session_id")?).await?;
-                let running = self.runtime.jobs.lock().await.contains_key(&session.id);
+                let jobs = self.runtime.jobs.lock().await;
+                let job = jobs.get(&session.id);
                 let mut result = serde_json::to_value(session)?;
-                result["running"] = json!(running);
+                result["running"] = json!(job.is_some());
+                if let Some(job) = job {
+                    result["approval_mode"] = json!(*job.approval_mode.borrow());
+                }
                 Ok(result)
             }
             "agent.start" => {
@@ -195,32 +208,105 @@ impl Server {
                     "Another agent is running. Stop it before starting a new task."
                 );
                 let c = self.config.lock().await;
-                ensure!(
-                    !c.key.is_empty(),
-                    "Add your Subquadratic API key in Settings"
-                );
-                let use_snap = match p.get("context_selection") {
-                    None => true,
-                    Some(mode) if mode == "snap" => true,
-                    Some(mode) if mode == "local" => false,
-                    _ => anyhow::bail!("context_selection must be local or snap"),
+                let selection_mode = match p.get("context_selection") {
+                    None => agent_core::SelectionMode::Auto,
+                    Some(mode) if mode == "auto" => agent_core::SelectionMode::Auto,
+                    Some(mode) if mode == "snap" => agent_core::SelectionMode::Snap,
+                    Some(mode) if mode == "local" => agent_core::SelectionMode::Local,
+                    _ => anyhow::bail!("context_selection must be auto, local, or snap"),
                 };
+                let snippet_packing = match p.get("context_packing") {
+                    None => true,
+                    Some(mode) if mode == "snippets" => true,
+                    Some(mode) if mode == "whole_files" => false,
+                    _ => anyhow::bail!("context_packing must be snippets or whole_files"),
+                };
+                let subq_review = p.get("subq_review").map_or(Ok(true), |value| {
+                    value.as_bool().context("subq_review must be a boolean")
+                })?;
+                let approval_mode = p
+                    .get("approval_mode")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()?
+                    .unwrap_or_default();
+                let required_checks: Vec<String> = p
+                    .get("required_checks")
+                    .map(|value| serde_json::from_value(value.clone()))
+                    .transpose()?
+                    .unwrap_or_default();
+                ensure!(
+                    required_checks.len() <= 16
+                        && required_checks
+                            .iter()
+                            .all(|check| !check.trim().is_empty() && check.len() <= 8192),
+                    "Provide at most 16 nonempty required check commands"
+                );
+                let (approval_mode, _) = watch::channel(approval_mode);
+                let isolated_checks = match p.get("check_mode") {
+                    None => None,
+                    Some(mode) if mode == "approved" => None,
+                    Some(mode) if mode == "isolated" => {
+                        Some(agent_tools::IsolatedChecks::from_environment()?)
+                    }
+                    _ => anyhow::bail!("check_mode must be approved or isolated"),
+                };
+                let (model, provider): (String, Box<dyn agent_models::ModelProvider>) =
+                    if let Some(model) = p.get("eval_codex_model") {
+                        let model = model.as_str().context("Invalid Codex eval model")?;
+                        ensure!(
+                            model.starts_with("gpt-")
+                                && model.len() < 120
+                                && model
+                                    .bytes()
+                                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.'),
+                            "Invalid Codex eval model"
+                        );
+                        let executable = std::env::var_os("SUBSTRATE_EVAL_CODEX")
+                            .context("Codex eval is disabled for this server")?;
+                        let selector = if c.key.is_empty() {
+                            ensure!(
+                                selection_mode == agent_core::SelectionMode::Local,
+                                "Use local selection when evaluating Codex without a SubQ key"
+                            );
+                            None
+                        } else {
+                            Some(agent_models::Subquadratic::new(c.key.clone())?)
+                        };
+                        (
+                            model.into(),
+                            Box::new(agent_models::Codex::new(executable.into(), selector)?),
+                        )
+                    } else {
+                        ensure!(
+                            !c.key.is_empty(),
+                            "Add your Subquadratic API key in Settings"
+                        );
+                        (
+                            c.model.clone(),
+                            Box::new(agent_models::Subquadratic::new(c.key.clone())?),
+                        )
+                    };
                 let config = agent_core::RunConfig {
-                    use_snap,
-                    approval_mode: p
-                        .get("approval_mode")
-                        .cloned()
-                        .map(serde_json::from_value)
-                        .transpose()?
-                        .unwrap_or_default(),
-                    key: c.key.clone(),
-                    model: c.model.clone(),
+                    selection_mode,
+                    snippet_packing,
+                    subq_review,
+                    required_checks,
+                    isolated_checks,
+                    approval_mode: approval_mode.clone(),
+                    model,
                     max_steps: c.max_steps,
                     context_budget_bytes: c.context_budget_bytes,
                 };
                 drop(c);
                 let token = CancellationToken::new();
-                jobs.insert(sid.clone(), token.clone());
+                jobs.insert(
+                    sid.clone(),
+                    Job {
+                        cancel: token.clone(),
+                        approval_mode,
+                    },
+                );
                 drop(jobs);
                 let server = self.clone();
                 tokio::spawn(async move {
@@ -231,6 +317,7 @@ impl Server {
                         server.storage.clone(),
                         server.runtime.clone(),
                         token.clone(),
+                        provider,
                     )
                     .await;
                     server.runtime.jobs.lock().await.remove(&sid);
@@ -248,15 +335,23 @@ impl Server {
                 });
                 Ok(json!({"started":true}))
             }
+            "agent.set_approval_mode" => {
+                let sid = str_arg(p, "session_id")?;
+                let mode = serde_json::from_value(p["approval_mode"].clone())?;
+                if let Some(job) = self.runtime.jobs.lock().await.get(sid) {
+                    job.approval_mode.send_replace(mode);
+                }
+                Ok(json!(true))
+            }
             "agent.interrupt" | "session.cancel" => {
-                if let Some(t) = self
+                if let Some(job) = self
                     .runtime
                     .jobs
                     .lock()
                     .await
                     .get(str_arg(p, "session_id")?)
                 {
-                    t.cancel();
+                    job.cancel.cancel();
                 }
                 Ok(json!(true))
             }
@@ -337,8 +432,16 @@ async fn main() -> Result<()> {
         config_path,
         config: Arc::new(Mutex::new(Config {
             key: std::env::var("SUBQ_API_KEY").unwrap_or_default(),
-            model: saved["model"].as_str().unwrap_or("subq-preview").into(),
-            max_steps: saved["max_steps"].as_u64().unwrap_or(20).clamp(1, 50) as usize,
+            model: agent_models::current_model(
+                saved["model"]
+                    .as_str()
+                    .unwrap_or(agent_models::DEFAULT_MODEL),
+            )
+            .into(),
+            max_steps: saved["max_steps"]
+                .as_u64()
+                .unwrap_or(DEFAULT_MAX_STEPS)
+                .clamp(1, MAX_MAX_STEPS) as usize,
             context_budget_bytes: saved["context_budget_bytes"]
                 .as_u64()
                 .unwrap_or(agent_context::DEFAULT_REPO_BUDGET as u64)
@@ -390,8 +493,8 @@ async fn main() -> Result<()> {
             }
         }
     }
-    for token in runtime.jobs.lock().await.values() {
-        token.cancel();
+    for job in runtime.jobs.lock().await.values() {
+        job.cancel.cancel();
     }
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     writer.abort();

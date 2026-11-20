@@ -13,3 +13,5 @@ futures-util.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 agent-protocol = { path = "../agent-protocol" }
+tempfile = "3"
+uuid.workspace = true

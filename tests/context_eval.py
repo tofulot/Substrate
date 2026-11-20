@@ -1,5 +1,6 @@
 """Compare context selectors through the Rust harness on isolated lookup and editing tasks."""
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -8,6 +9,7 @@ import os
 from pathlib import Path
 import queue
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -130,8 +132,9 @@ class Fixture(BaseHTTPRequestHandler):
         messages = request["messages"]
         task = next(m["content"] for m in reversed(messages) if m["role"] == "user")
         case = next(case for case in CASES if case.prompt == task)
-        context = {json.loads(line)["path"] for line in messages[1]["content"].splitlines()
-                   if line.startswith("{")}
+        rows = (json.loads(line) for line in messages[1]["content"].splitlines()
+                if line.startswith("{"))
+        context = {row["path"] for row in rows if "path" in row}
         assert "ignored.py" not in context
         missing = [path for path in case.files if path not in context]
         tool_names = {call["function"]["name"] for message in messages
@@ -173,7 +176,7 @@ class Fixture(BaseHTTPRequestHandler):
 @contextmanager
 def provider(live):
     if live:
-        yield "https://api.subq.ai/v1", os.environ["SUBQ_API_KEY"]
+        yield "https://api.subq.ai/v1", os.environ.get("SUBQ_API_KEY", "")
         return
     with ThreadingHTTPServer(("127.0.0.1", 0), Fixture) as server:
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -185,7 +188,7 @@ def provider(live):
             thread.join()
 
 
-def run_case(directory, case, size, mode, url, key, timeout):
+def run_case(directory, case, size, mode, url, key, timeout, **generation):
     repo = directory / "repo"
     make_repo(repo, size)
     initial = tree_contents(repo)
@@ -196,10 +199,11 @@ def run_case(directory, case, size, mode, url, key, timeout):
     targets = {edit[0] for edit in case.edits}
     client = Client(directory, url, key=key)
     try:
-        client.rpc("config.update", model="subq-preview", context_budget_bytes=BUDGET, max_steps=8)
+        client.rpc("config.update", model="subq-savant-1.4", context_budget_bytes=BUDGET, max_steps=8)
         session = client.rpc("session.create", project=str(repo))["id"]
         client.rpc("agent.start", session_id=session, task=case.prompt,
-                   context_selection=mode, approval_mode="ask")
+                   context_selection=mode, approval_mode="ask",
+                   required_checks=[case.check] if case.edits else [], **generation)
         rejected_tools = 0
         approved_edits = 0
         try:
@@ -238,6 +242,17 @@ def run_case(directory, case, size, mode, url, key, timeout):
         actual = tree_contents(repo)
         output_correct = actual == expected and (bool(case.edits) or answer == case.answer)
         included = {file["path"] for file in first["files"]} if first else set()
+        check_passed = False
+        for message in messages:
+            tool = message.get("tool", {})
+            if tool.get("status") != "completed":
+                continue
+            if tool.get("name") == "apply_patch":
+                check_passed = False
+            elif case.edits and tool.get("name") == "run_check" and tool["arguments"]["command"] == case.check:
+                check_passed = True
+        calls = generated + selection
+        token_values = [(call["metrics"].get("usage") or {}).get("input_tokens") for call in calls]
         return {
             "case": case.name, "task_type": "edit" if case.edits else "lookup",
             "repo_size": size, "repo_files": len(initial),
@@ -246,7 +261,25 @@ def run_case(directory, case, size, mode, url, key, timeout):
             "changed_files": sorted(path for path in initial.keys() | actual.keys()
                                     if initial.get(path) != actual.get(path)),
             "error": event["params"].get("message"),
-            "success": event["method"] == "agent.completed" and output_correct and not rejected_tools,
+            "success": event["method"] == "agent.completed" and output_correct and not rejected_tools
+                       and (not case.edits or check_passed),
+            "task_success": event["method"] == "agent.completed" and output_correct
+                            and (not case.edits or check_passed),
+            "output_correct": output_correct,
+            "exact_check_passed": check_passed if case.edits else None,
+            "answer": answer if not case.edits else None,
+            "all_provider_input_tokens": sum(token_values) if calls and None not in token_values else None,
+            "calls": [
+                {field: call[field] for field in ("kind", "model", "status", "tool_calls", "metrics")}
+                for call in calls
+            ],
+            "first_snapshot_required_ranks": [
+                rank for rank in first["selection"]["ranks"] if rank["path"] in case.files
+            ] if first else [],
+            "tool_results": [
+                {field: message["tool"].get(field) for field in ("name", "status")}
+                for message in messages if message.get("tool")
+            ],
             "first_snapshot_strategy": first["selection"]["strategy"] if first else None,
             "first_snapshot_hit": set(case.files) <= included,
             "first_snapshot_required_files": sorted(set(case.files) & included),
@@ -270,48 +303,74 @@ def run_case(directory, case, size, mode, url, key, timeout):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--live", action="store_true", help="Use SubQ API credits and send the synthetic tasks to SubQ")
+    parser.add_argument("--generator", choices=("subq", "codex"), default="subq")
+    parser.add_argument("--model", help="Codex model ID when --generator=codex")
+    parser.add_argument("--modes", nargs="+", choices=("local", "snap", "auto"))
+    parser.add_argument("--jobs", type=int, default=1, help="Number of isolated harness processes to run in parallel")
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--timeout", type=float, default=120, help="Seconds per run")
     args = parser.parse_args()
-    if args.repeats < 1 or args.timeout <= 0:
-        parser.error("repeats and timeout must be positive")
-    if args.live and not os.environ.get("SUBQ_API_KEY", "").strip():
-        parser.error("--live requires SUBQ_API_KEY")
+    if args.repeats < 1 or args.timeout <= 0 or not 1 <= args.jobs <= 8:
+        parser.error("repeats and timeout must be positive and jobs must be 1–8")
+    codex = args.generator == "codex"
+    modes = tuple(dict.fromkeys(args.modes or (("local",) if codex else ("local", "snap"))))
+    live = args.live or codex
+    if live and (not codex or any(mode != "local" for mode in modes)) and not os.environ.get("SUBQ_API_KEY", "").strip():
+        parser.error("live SubQ generation or Snap selection requires SUBQ_API_KEY")
+    generation = {}
+    if codex:
+        executable = os.environ.get("SUBSTRATE_EVAL_CODEX") or shutil.which("codex")
+        if not executable or not args.model:
+            parser.error("Codex evaluation requires the Codex CLI and --model")
+        os.environ["SUBSTRATE_EVAL_CODEX"] = str(Path(executable).absolute())
+        generation["eval_codex_model"] = args.model
+    elif args.model:
+        parser.error("--model requires --generator=codex")
     subprocess.run(["cargo", "build", "-q", "-p", "agent-server"], cwd=ROOT, check=True)
     results = []
-    with tempfile.TemporaryDirectory(prefix="substrate-context-eval-") as tmp, provider(args.live) as (url, key):
-        for trial in range(args.repeats):
+    with tempfile.TemporaryDirectory(prefix="substrate-context-eval-") as tmp, provider(live) as (url, key), \
+            ThreadPoolExecutor(max_workers=args.jobs) as workers:
+        pending = {}
+        for trial in range(1, args.repeats + 1):
             for size_index, size in enumerate(REPO_SIZES):
                 for index, case in enumerate(CASES):
-                    if (trial + index + size_index) % 2 == 0:
-                        modes = ("local", "snap")
-                    else:
-                        modes = ("snap", "local")
-                    for mode in modes:
+                    order = modes if (trial - 1 + index + size_index) % 2 == 0 else modes[::-1]
+                    for mode in order:
                         name = f"{trial}-{size}-{case.name}-{mode}"
-                        result = run_case(Path(tmp) / name, case, size, mode, url, key, args.timeout)
-                        results.append({"trial": trial + 1, **result})
-                        print(f'{len(results)}/{args.repeats * len(REPO_SIZES) * len(CASES) * 2} '
-                              f'{size} {case.name} {mode} {result["status"]} '
-                              f'success={result["success"]}', file=sys.stderr, flush=True)
+                        future = workers.submit(run_case, Path(tmp) / name, case, size, mode, url,
+                                                key, args.timeout, **generation)
+                        pending[future] = trial, size, case.name, mode
+        for future in as_completed(pending):
+            trial, size, case_name, mode = pending[future]
+            result = future.result()
+            results.append({"trial": trial, **result})
+            print(f'{len(results)}/{len(pending)} {size} {case_name} {mode} {result["status"]} '
+                  f'success={result["success"]}', file=sys.stderr, flush=True)
+    results.sort(key=lambda row: (row["trial"], row["repo_size"], row["case"], row["mode"]))
     summary = {}
-    for mode in ("local", "snap"):
+    for mode in modes:
         rows = [r for r in results if r["mode"] == mode]
         summary[mode] = {"runs": len(rows)}
         for key in ("success", "first_snapshot_hit", "missed_reads", "generation_context_bytes",
-                    "generation_calls", "snap_calls", "snap_ms", "elapsed_ms"):
+                    "generation_calls", "snap_calls", "snap_ms", "elapsed_ms", "all_provider_input_tokens"):
             values = [row[key] for row in rows]
             summary[mode][key] = sum(values) if all(value is not None for value in values) else None
-    print(json.dumps({"provider": "live" if args.live else "scripted fixture",
+    print(json.dumps({"provider": args.generator if live else "scripted fixture",
+                      "model": args.model if codex else "subq-savant-1.4",
                       "budget_bytes": BUDGET, "totals": summary, "runs": results}, indent=2))
-    if not args.live:
+    if not live:
         # A fixture checks the measurement pipeline. Its results say nothing about real model quality.
         assert all(r["success"] for r in results)
         for row in results:
-            assert (row["snap_calls"] > 0) == (row["mode"] == "snap")
+            if row["mode"] in ("local", "snap"):
+                assert (row["snap_calls"] > 0) == (row["mode"] == "snap")
             assert row["successful_reads"] == row["missed_reads"]
             if row["repo_size"] == "large":
                 assert row["eligible_files"] > 128
+            if row["case"] == "export-limit":
+                assert row["first_snapshot_hit"], "The CSV implementation should survive the distractors"
+                if row["mode"] == "snap":
+                    assert row["first_snapshot_required_ranks"][0]["snap_candidate"]
             if row["case"] == "session-idle" and not row["first_snapshot_hit"]:
                 assert row["missed_reads"] == 2
                 ignored = next(m for m in row["missed_paths"] if m["path"] == "ignored.py")

@@ -268,7 +268,9 @@ function NewWorkspaceButton({ disabled }: { disabled: boolean }) {
               />
             </div>
             {error && (
-              <p className="form-error" role="alert">{error}</p>
+              <p className="form-error" role="alert">
+                {error}
+              </p>
             )}
             <div className="modal-actions">
               <Dialog.Close asChild>
@@ -295,6 +297,10 @@ export default function App() {
     config,
     connected,
     running,
+    starting,
+    approvalMode,
+    changingApprovalMode,
+    setApprovalMode,
     navigating,
     error,
     revision,
@@ -305,7 +311,6 @@ export default function App() {
   function setDraft(value: string) {
     setDrafts((current) => ({ ...current, [draftKey]: value }));
   }
-  const [approvalMode, setApprovalMode] = useState<ApprovalMode>("ask");
   const [sidebar, setSidebar] = useState(true);
   const [panel, setPanel] = useState(false);
   const [tab, setTab] = useState<"files" | "changes" | "insights">("files");
@@ -319,7 +324,9 @@ export default function App() {
   const [approving, setApproving] = useState(false);
   const [query, setQuery] = useState("");
   const [searching, setSearching] = useState(false);
-  const [collapsedProjects, setCollapsedProjects] = useState(() => new Set<string>());
+  const [collapsedProjects, setCollapsedProjects] = useState(
+    () => new Set<string>(),
+  );
   const scroll = useRef<HTMLDivElement>(null);
   const input = useRef<HTMLTextAreaElement>(null);
   const stick = useRef(true);
@@ -478,7 +485,14 @@ export default function App() {
     }
   }
   function submit() {
-    if (!draft.trim() || running || navigating) return;
+    if (
+      !draft.trim() ||
+      running ||
+      starting ||
+      navigating ||
+      changingApprovalMode
+    )
+      return;
     if (!config?.has_key) {
       useStore.setState({ settings: true });
       return;
@@ -490,7 +504,7 @@ export default function App() {
     const task = draft.trim();
     setDraft("");
     stick.current = true;
-    void useStore.getState().send(task, approvalMode);
+    void useStore.getState().send(task);
   }
   const searchTerm = query.trim().toLowerCase();
   const projectGroups = useMemo(() => {
@@ -842,7 +856,7 @@ export default function App() {
                         <div className="message-author">
                           {message.role === "user" ? "You" : "Substrate"}
                           {message.role === "assistant" && (
-                            <span>SUBQ PREVIEW</span>
+                            <span>SUBQ SAVANT</span>
                           )}
                         </div>
                         <div className="markdown">
@@ -930,7 +944,7 @@ export default function App() {
                     onClick={() => useStore.setState({ settings: true })}
                   >
                     <span className="model-dot" />
-                    SubQ Preview
+                    SubQ Savant
                     <ChevronDown size={12} />
                   </button>
                   <span className="composer-separator" />
@@ -940,9 +954,9 @@ export default function App() {
                       aria-label="Approval mode"
                       title="Shell commands always require approval"
                       value={approvalMode}
-                      disabled={!!running}
+                      disabled={starting || changingApprovalMode}
                       onChange={(event) =>
-                        setApprovalMode(event.target.value as ApprovalMode)
+                        void setApprovalMode(event.target.value as ApprovalMode)
                       }
                     >
                       <option value="ask">Ask before acting</option>
@@ -950,6 +964,11 @@ export default function App() {
                         Approve all code edits
                       </option>
                     </select>
+                    <ChevronDown
+                      className="approval-chevron"
+                      size={12}
+                      aria-hidden="true"
+                    />
                   </label>
                 </div>
                 {running ? (
@@ -967,7 +986,12 @@ export default function App() {
                 ) : (
                   <button
                     className="send-button"
-                    disabled={!draft.trim() || navigationDisabled}
+                    disabled={
+                      !draft.trim() ||
+                      starting ||
+                      navigationDisabled ||
+                      changingApprovalMode
+                    }
                     aria-label="Send message"
                     onClick={submit}
                   >

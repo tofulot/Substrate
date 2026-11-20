@@ -16,6 +16,9 @@ interface State {
   sessions: Session[];
   config: Config | null;
   running: string | null;
+  starting: boolean;
+  approvalMode: ApprovalMode;
+  changingApprovalMode: boolean;
   navigating: boolean;
   error: string | null;
   connected: boolean;
@@ -28,7 +31,8 @@ interface State {
   createProject(name: string): Promise<void>;
   selectSession(id: string): Promise<void>;
   newSession(): Promise<void>;
-  send(task: string, approvalMode: ApprovalMode): Promise<void>;
+  send(task: string): Promise<void>;
+  setApprovalMode(mode: ApprovalMode): Promise<void>;
   event(event: AgentEvent): void;
   refreshSessions(): Promise<void>;
   setError(error: unknown): void;
@@ -39,6 +43,9 @@ export const useStore = create<State>((set, get) => ({
   sessions: [],
   config: null,
   running: null,
+  starting: false,
+  approvalMode: "ask",
+  changingApprovalMode: false,
   navigating: false,
   error: null,
   connected: false,
@@ -99,9 +106,24 @@ export const useStore = create<State>((set, get) => ({
       get().setError(error);
     }
   },
-  send: async (task, approvalMode) => {
-    const { session, running, navigating, config } = get();
-    if (running || navigating || !task.trim()) return;
+  send: async (task) => {
+    const {
+      session,
+      running,
+      starting,
+      navigating,
+      config,
+      approvalMode,
+      changingApprovalMode,
+    } = get();
+    if (
+      running ||
+      starting ||
+      navigating ||
+      changingApprovalMode ||
+      !task.trim()
+    )
+      return;
     if (!config?.has_key) {
       set({ settings: true });
       return;
@@ -112,6 +134,7 @@ export const useStore = create<State>((set, get) => ({
     }
     set({
       running: session.id,
+      starting: true,
       error: null,
       session: {
         ...session,
@@ -131,6 +154,28 @@ export const useStore = create<State>((set, get) => ({
     } catch (error) {
       set({ running: null, session });
       get().setError(error);
+    } finally {
+      set({ starting: false });
+    }
+  },
+  setApprovalMode: async (mode) => {
+    const { running, starting, changingApprovalMode } = get();
+    if (starting || changingApprovalMode) return;
+    if (!running) {
+      set({ approvalMode: mode });
+      return;
+    }
+    set({ changingApprovalMode: true });
+    try {
+      await api.rpc("agent.set_approval_mode", {
+        session_id: running,
+        approval_mode: mode,
+      });
+      set({ approvalMode: mode });
+    } catch (error) {
+      get().setError(error);
+    } finally {
+      set({ changingApprovalMode: false });
     }
   },
   event: (event) => {
@@ -262,6 +307,7 @@ function activateSession(session: Session, branch: string | null) {
     session,
     project: { path, name: workspaceName(path), branch },
     running: session.running ? session.id : null,
+    approvalMode: session.approval_mode ?? state.approvalMode,
     error: null,
     terminalOutput: "",
     revision: state.revision + 1,

@@ -21,6 +21,7 @@ export interface Message {
 }
 export interface Session {
   running?: boolean;
+  approval_mode?: ApprovalMode;
   id: string;
   project: string;
   title: string;
@@ -74,6 +75,7 @@ export interface FileVersion {
   path: string;
   hash: string;
   bytes: number;
+  excerpt?: { start_line: number; end_line: number };
 }
 export interface ContextChange {
   path: string;
@@ -95,6 +97,7 @@ export interface ContextSnapshot {
   scanned_files: number;
   truncated: boolean;
   files: FileVersion[];
+  snippet_packing?: boolean;
   excluded: { path: string; reason: string }[];
   changes: ContextChange[];
   selection?: ContextSelection | null;
@@ -113,6 +116,9 @@ export interface ContextSelection {
     score: number;
     confidence: number | null;
     source: string;
+    local_rank?: number | null;
+    snap_candidate?: boolean;
+    context_stage?: "included" | "rerank" | "packing" | null;
   }[];
 }
 export interface ContextState {
@@ -140,6 +146,7 @@ export interface CallTrace {
   context_revision: number;
   context_bytes: number;
   history_bytes: number;
+  history_stored_bytes?: number;
   estimated_input_tokens: number | null;
   tool_calls: number;
   metrics: {
@@ -149,6 +156,7 @@ export interface CallTrace {
     first_output_ms: number | null;
     http_status: number | null;
     finish_reason: string | null;
+    reasoning_effort?: string;
     usage: TokenUsage | null;
   };
 }

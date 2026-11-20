@@ -1,12 +1,16 @@
 use serde_json::Value;
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 type PendingApprovals = HashMap<String, (String, oneshot::Sender<bool>)>;
+pub struct Job {
+    pub cancel: CancellationToken,
+    pub approval_mode: watch::Sender<agent_protocol::ApprovalMode>,
+}
 #[derive(Clone)]
 pub struct Runtime {
     pub events: mpsc::Sender<Value>,
-    pub jobs: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    pub jobs: Arc<Mutex<HashMap<String, Job>>>,
     approvals: Arc<Mutex<PendingApprovals>>,
 }
 impl Runtime {

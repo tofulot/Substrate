@@ -32,10 +32,10 @@ const server = createServer(async (req, res) => {
     res.writeHead(401).end()
     return
   }
-  if (req.url === '/v1/models') { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ data: [{ id: 'subq-preview' }, { id: 'subq-snap-1.1' }] })); return }
+  if (req.url === '/v1/models') { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ data: [{ id: 'subq-savant-1.4' }, { id: 'subq-snap-1.2' }] })); return }
   const data = JSON.parse(body)
   if (req.url === '/v1/systemone') {
-    expect(data.model).toBe('subq-snap-1.1')
+    expect(data.model).toBe('subq-snap-1.2')
     expect(body).not.toContain('PRIVATE_TEST_SECRET')
     expect(Object.keys(data.questions).length).toBeLessThanOrEqual(128)
     snapCalls++
@@ -43,7 +43,7 @@ const server = createServer(async (req, res) => {
     res.end(JSON.stringify({ answers: Object.fromEntries(data.state.files.map(file => [file.id, { type: 'score', score: file.path === 'hello.ts' ? 3 : 1, confidence: 0.95 }])), usage: { input_tokens: 40, output_tokens: 0 } }))
     return
   }
-  expect(data.model).toBe('subq-preview'); expect(data.store).toBe(false)
+  expect(data.model).toBe('subq-savant-1.4'); expect(data.store).toBe(false)
   const context = data.messages[1].content
   expect(context).toContain('Repository snapshot ')
   expect(context).not.toContain('PRIVATE_TEST_SECRET')
@@ -58,7 +58,8 @@ const server = createServer(async (req, res) => {
     ['run_check', { command: commandCheck, purpose: 'Verify the updated export' }],
     null,
     ['apply_patch', { path: 'automatic.ts', old_text: '', new_text: 'export const applied = true\n' }],
-    ['run_check', { command: "grep -qx 'export const applied = true' automatic.ts", purpose: 'Verify the automatic code edit' }]
+    ['run_check', { command: "grep -qx 'export const applied = true' automatic.ts", purpose: 'Verify the automatic code edit' }],
+    ['apply_patch', { path: 'automatic.ts', old_text: 'true', new_text: 'false' }]
   ]
   res.writeHead(200, { 'Content-Type': 'text/event-stream' })
   if (rounds[round]) {
@@ -96,10 +97,13 @@ try {
   await setupPage.getByRole('button', { name: /^Settings/ }).click()
   await setupPage.getByLabel(/^API key/).fill(fixtureKey)
   await setupPage.getByLabel('Repository context budget').selectOption('1048576')
+  await expect(setupPage.getByLabel('Model turns per task')).toHaveValue('64')
+  await setupPage.getByLabel('Model turns per task').fill('96')
   await setupPage.getByRole('button', { name: 'Save settings' }).click()
   await expect.poll(() => setupPage.evaluate(() => window.substrate.rpc('config.get'))).toMatchObject({
     has_key: true,
     context_budget_bytes: 1048576,
+    max_steps: 96,
   })
   const encryptedKey = await readFile(join(profile, 'subq-key.enc'))
   expect(encryptedKey.includes(fixtureKey)).toBe(false)
@@ -133,10 +137,11 @@ try {
   const baseline = await page.evaluate(async () => (await window.substrate.rpc('context.get', { session_id: localStorage.getItem('substrate.session') })).snapshot)
   await page.getByRole('button', { name: /^Settings/ }).click()
   await expect(page.getByLabel(/^API key/)).toHaveValue('')
+  await expect(page.getByLabel('Model turns per task')).toHaveValue('96')
   await expect(page.getByText('A key is securely stored', { exact: true })).toBeVisible()
   await expect(page.getByLabel('Repository context budget')).toHaveValue('1048576')
   await page.getByRole('button', { name: 'Test connection' }).click()
-  await expect(page.getByText('Connected · subq-preview is available')).toBeVisible()
+  await expect(page.getByText('Connected · subq-savant-1.4 is available')).toBeVisible()
   await page.getByRole('button', { name: 'Close settings' }).click()
   await page.getByRole('button', { name: 'Toggle file panel' }).click()
   await page.getByRole('button', { name: 'hello.ts' }).click()
@@ -171,14 +176,14 @@ try {
   await page.screenshot({ animations: 'disabled', path: join(root, 'test-results/workspace.png') })
   await page.getByRole('button', { name: 'Insights', exact: true }).click()
   await expect(page.getByText('Snapshot v3', { exact: true })).toBeVisible()
-  await expect(page.getByText('7 model call(s).', { exact: false })).toBeVisible()
-  await expect(page.getByText('8,089', { exact: true })).toBeVisible()
-  await expect(page.getByText('6/7 calls', { exact: true }).first()).toBeVisible()
+  await expect(page.getByText('5 model call(s).', { exact: false })).toBeVisible()
+  await expect(page.getByText('8,009', { exact: true })).toBeVisible()
+  await expect(page.getByText('4/5 calls', { exact: true }).first()).toBeVisible()
   const report = await page.evaluate(async () => window.substrate.rpc('usage.get', { session_id: localStorage.getItem('substrate.session') }))
-  expect(report.calls.length).toBe(7)
-  expect(snapCalls).toBe(2)
-  expect(report.calls.filter(call => call.kind === 'context_selection').length).toBe(2)
-  await expect(page.getByText('Snap-assisted selection', { exact: true })).toBeVisible()
+  expect(report.calls.length).toBe(5)
+  expect(snapCalls).toBe(0)
+  expect(report.calls.filter(call => call.kind === 'context_selection').length).toBe(0)
+  await expect(page.getByText('Local task selection', { exact: true })).toBeVisible()
   expect(report.calls.filter(call => call.metrics.usage === null).length).toBe(1)
   await writeFile(join(repo, 'hello.ts'), 'export const hello = "substrate" // external\n')
   await expect(page.getByText('Workspace changed', { exact: true })).toBeVisible({ timeout: 15000 })
@@ -196,20 +201,35 @@ try {
   await page.getByRole('button', { name: 'Toggle file panel' }).click()
   await page.getByRole('button', { name: 'Insights', exact: true }).click()
   await expect(page.getByText('Snapshot v4', { exact: true })).toBeVisible()
-  await expect(page.getByText('8,089', { exact: true })).toBeVisible()
+  await expect(page.getByText('8,009', { exact: true })).toBeVisible()
   // Renderer has no Node primitives, no raw IPC and no credential retrieval.
-  expect(await page.evaluate(() => ({ node: typeof window.require, process: typeof window.process, exposed: Object.keys(window.substrate).sort() }))).toEqual({ node: 'undefined', process: 'undefined', exposed: ['createProject','onEvent','openProject','platform','rpc','setApiKey'] })
-  const secretError = await page.evaluate(async () => { try { await window.substrate.rpc('config.credentials', { key: 'bad' }); return '' } catch (e) { return e.message } })
-  expect(secretError).toContain('Unsupported operation')
-  await approvalMode.selectOption({ label: 'Approve all code edits' })
+  expect(await page.evaluate(() => ({ node: typeof window.require, process: typeof window.process, exposed: Object.keys(window.substrate).sort() }))).toEqual({
+    node: 'undefined', process: 'undefined',
+    exposed: ['createProject', 'onEvent', 'openProject', 'platform', 'rpc', 'setApiKey']
+  })
+  await expect(page.evaluate(() => window.substrate.rpc('config.credentials', { key: 'bad' }))).rejects.toThrow(/Unsupported operation/)
   await page.getByRole('textbox', { name: 'Message Substrate' }).fill('Apply a code edit automatically')
   await page.getByRole('button', { name: 'Send message' }).click()
-  await expect(approvalMode).toBeDisabled()
+  await expect(page.getByText(/^Waiting for your approval/)).toBeVisible()
+  await expect(approvalMode).toBeEnabled()
+  expect(await stat(join(repo, 'automatic.ts')).catch(error => error.code)).toBe('ENOENT')
+  await approvalMode.selectOption({ label: 'Approve all code edits' })
+  await expect(approvalMode).toHaveValue('approve_edits')
+  await expect.poll(() => readFile(join(repo, 'automatic.ts'), 'utf8').catch(() => '')).toBe('export const applied = true\n')
   await page.getByRole('button', { name: 'Review', exact: true }).click()
   await expect(page.getByRole('button', { name: 'Approve command' })).toBeVisible()
-  expect(await readFile(join(repo, 'automatic.ts'), 'utf8')).toBe('export const applied = true\n')
+  await page.reload()
+  await expect(approvalMode).toHaveValue('approve_edits')
+  await approvalMode.selectOption({ label: 'Ask before acting' })
+  await expect(approvalMode).toHaveValue('ask')
+  await page.getByRole('button', { name: 'Review', exact: true }).click()
   await page.getByRole('button', { name: 'Approve command' }).click()
+  await page.getByRole('button', { name: 'Review', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'Approve edit' })).toBeVisible()
+  expect(await readFile(join(repo, 'automatic.ts'), 'utf8')).toBe('export const applied = true\n')
+  await page.getByRole('button', { name: 'Decline', exact: true }).click()
   await expect(page.locator('.message-assistant').last()).toContainText('Applied the code edit.')
+  expect(await readFile(join(repo, 'automatic.ts'), 'utf8')).toBe('export const applied = true\n')
   await expect(approvalMode).toBeEnabled()
   const newFolder = page.getByRole('button', { name: 'New folder' })
   const folderDialog = page.getByRole('dialog', { name: 'New workspace folder' })
