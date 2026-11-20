@@ -157,15 +157,15 @@ jobs:
       - name: Upload and publish verified release
         run: |
           cat > release-notes.md <<'NOTES'
-          Native macOS coding workspace powered by Subquadratic's SubQ Preview.
+          Substrate is a macOS coding workspace powered by Subquadratic.
 
           **Downloads:** Apple Silicon (arm64) DMG, ZIP, and SHA-256 checksums. Open the DMG and drag Substrate to Applications, or extract the ZIP.
 
-          **Requirements:** A Subquadratic API key with SubQ Preview access. Git features require Git. The Rust harness and ripgrep are bundled; Node.js and Cargo are not needed to run the app.
+          **Requirements:** Use a Subquadratic API key with SubQ Savant access. A Brave Search API key is optional. Git features require Git. The app bundles the Rust harness and ripgrep and runs without Node.js or Cargo.
 
           **Signing:** This build is unsigned and unnotarized.
 
-          **Execution:** Edits and commands require approval. Approved commands run with your host user permissions without an OS sandbox.
+          **Execution:** Commands always require approval and run with your user permissions. Edits ask for approval by default. The optional isolated verification profile runs checks with a read-only checkout, writable scratch space, and blocked networking.
 
           **Validation:** Source checks, Rust unit/integration tests, the packaged Electron app, and installer checks pass before publication. Model tests use local API fixtures; live inference requires your own enabled key.
           NOTES

@@ -12,6 +12,7 @@ export default function Settings() {
   const open = useStore((s) => s.settings);
   const config = useStore((s) => s.config);
   const [key, setKey] = useState("");
+  const [searchKey, setSearchKey] = useState("");
   const [model, setModel] = useState("subq-savant-1.4");
   const [budget, setBudget] = useState(512 * 1024);
   const [turnLimit, setTurnLimit] = useState(String(DEFAULT_MODEL_TURNS));
@@ -27,6 +28,7 @@ export default function Settings() {
       setError("");
     } else {
       setKey("");
+      setSearchKey("");
     }
   }, [open, config?.model, config?.context_budget_bytes, config?.max_steps]);
   async function save() {
@@ -43,6 +45,10 @@ export default function Settings() {
       if (key.trim()) {
         await api.setApiKey(key.trim());
         setKey("");
+      }
+      if (searchKey.trim()) {
+        await api.setSearchApiKey(searchKey.trim());
+        setSearchKey("");
       }
       await api.rpc("config.update", {
         model,
@@ -80,15 +86,22 @@ export default function Settings() {
       setBusy(false);
     }
   }
-  async function removeKey() {
+  async function removeKey(provider: "subq" | "search") {
     setBusy(true);
     setError("");
     setStatus("");
     try {
-      await api.setApiKey("");
-      setKey("");
+      if (provider === "search") {
+        await api.setSearchApiKey("");
+        setSearchKey("");
+      } else {
+        await api.setApiKey("");
+        setKey("");
+      }
       useStore.setState({ config: await api.rpc<Config>("config.get") });
-      setStatus("Saved key removed");
+      setStatus(
+        provider === "search" ? "Search key removed" : "Saved key removed",
+      );
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -198,6 +211,26 @@ export default function Settings() {
           <p className="field-help" id="model-turn-limit-help">
             Applies to new tasks. The default is {DEFAULT_MODEL_TURNS} turns.
           </p>
+          <label htmlFor="search-api-key">
+            Brave Search API key{" "}
+            <span>{config?.has_search_key ? "Configured" : "Optional"}</span>
+          </label>
+          <div className="key-field">
+            <KeyRound size={16} />
+            <input
+              id="search-api-key"
+              type="password"
+              autoComplete="off"
+              value={searchKey}
+              onChange={(event) => setSearchKey(event.target.value)}
+              placeholder="Enter your Brave Search API key"
+              aria-describedby="search-key-help"
+            />
+          </div>
+          <p className="field-help" id="search-key-help">
+            Web search sends queries to Brave. Fetching a public URL works
+            without a search key.
+          </p>
           <div className="permission-note">
             <strong>You're in control</strong>
             <p>
@@ -232,10 +265,19 @@ export default function Settings() {
           {config?.has_key && (
             <button
               className="text-button remove-key"
-              onClick={() => void removeKey()}
+              onClick={() => void removeKey("subq")}
               disabled={busy}
             >
               Remove saved key
+            </button>
+          )}
+          {config?.has_search_key && (
+            <button
+              className="text-button remove-key"
+              onClick={() => void removeKey("search")}
+              disabled={busy}
+            >
+              Remove search key
             </button>
           )}
         </Dialog.Content>

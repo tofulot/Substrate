@@ -90,6 +90,7 @@ impl Codex {
             .arg("-")
             .current_dir(workspace.path())
             .env_remove("SUBQ_API_KEY")
+            .env_remove("BRAVE_SEARCH_API_KEY")
             .env_remove("SUBSTRATE_EVAL_CODEX")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

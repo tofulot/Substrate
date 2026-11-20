@@ -26,6 +26,7 @@ const devRg = mac && !process.env.SUBSTRATE_TEST_EXECUTABLE
   ? process.env.SUBSTRATE_RG ?? execFileSync('which', ['rg'], { encoding: 'utf8' }).trim()
   : undefined
 const fixtureKey = `fixture-${randomUUID()}`
+const searchKey = `fixture-${randomUUID()}`
 const server = createServer(async (req, res) => {
   let body = ''; for await (const chunk of req) body += chunk
   if (req.headers.authorization !== `Bearer ${fixtureKey}`) {
@@ -68,7 +69,7 @@ const server = createServer(async (req, res) => {
     res.write(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'tool_calls' }] })}\n\n`)
   } else {
     const deltas = round === 4
-      ? ['Updated ', '`hello.ts`', ' and verified the command.']
+      ? ['Updated ', '`hello.ts`', ' and verified the command. [Example source](https://example.com/).']
       : ['Applied the code edit.']
     for (const content of deltas) {
       res.write(`data: ${JSON.stringify({ choices: [{ delta: { content }, finish_reason: null }] })}\n\n`)
@@ -89,24 +90,28 @@ try {
   const launchOptions = {
     ...(executablePath ? { executablePath } : {}),
     args: [...(executablePath ? [] : [root]), ...(mac ? ['--use-mock-keychain'] : []), `--user-data-dir=${profile}`],
-    env: { ...process.env, ...(mac ? { PATH: '/usr/bin:/bin', CFFIXED_USER_HOME: temp } : {}), ...(devRg ? { SUBSTRATE_RG: devRg } : {}), HOME: temp, SUBQ_API_KEY: '', SUBSTRATE_API_BASE: `http://127.0.0.1:${server.address().port}/v1`, ELECTRON_RENDERER_URL: '' },
+    env: { ...process.env, ...(mac ? { PATH: '/usr/bin:/bin', CFFIXED_USER_HOME: temp } : {}), ...(devRg ? { SUBSTRATE_RG: devRg } : {}), HOME: temp, SUBQ_API_KEY: '', BRAVE_SEARCH_API_KEY: '', SUBSTRATE_API_BASE: `http://127.0.0.1:${server.address().port}/v1`, ELECTRON_RENDERER_URL: '' },
   }
   delete launchOptions.env.SUBSTRATE_DB
   app = await electron.launch({ ...launchOptions, env: { ...launchOptions.env, SUBSTRATE_DB: join(profile, 'sessions.db') } })
   const setupPage = await app.firstWindow()
   await setupPage.getByRole('button', { name: /^Settings/ }).click()
   await setupPage.getByLabel(/^API key/).fill(fixtureKey)
+  await setupPage.getByLabel(/^Brave Search API key/).fill(searchKey)
   await setupPage.getByLabel('Repository context budget').selectOption('1048576')
   await expect(setupPage.getByLabel('Model turns per task')).toHaveValue('64')
   await setupPage.getByLabel('Model turns per task').fill('96')
   await setupPage.getByRole('button', { name: 'Save settings' }).click()
   await expect.poll(() => setupPage.evaluate(() => window.substrate.rpc('config.get'))).toMatchObject({
     has_key: true,
+    has_search_key: true,
     context_budget_bytes: 1048576,
     max_steps: 96,
   })
   const encryptedKey = await readFile(join(profile, 'subq-key.enc'))
   expect(encryptedKey.includes(fixtureKey)).toBe(false)
+  const encryptedSearchKey = await readFile(join(profile, 'brave-search-key.enc'))
+  expect(encryptedSearchKey.includes(searchKey)).toBe(false)
   const legacySession = await setupPage.evaluate(project => window.substrate.rpc('session.create', { project }), repo)
   await app.close()
 
@@ -137,6 +142,11 @@ try {
   const baseline = await page.evaluate(async () => (await window.substrate.rpc('context.get', { session_id: localStorage.getItem('substrate.session') })).snapshot)
   await page.getByRole('button', { name: /^Settings/ }).click()
   await expect(page.getByLabel(/^API key/)).toHaveValue('')
+  await expect(page.getByLabel(/^Brave Search API key/)).toHaveValue('')
+  await expect(page.getByRole('button', { name: 'Remove search key' })).toBeVisible()
+  await page.getByRole('button', { name: 'Remove search key' }).click()
+  await expect(page.getByText('Search key removed', { exact: true })).toBeVisible()
+  expect(await page.evaluate(() => window.substrate.rpc('config.get'))).toMatchObject({ has_search_key: false })
   await expect(page.getByLabel('Model turns per task')).toHaveValue('96')
   await expect(page.getByText('A key is securely stored', { exact: true })).toBeVisible()
   await expect(page.getByLabel('Repository context budget')).toHaveValue('1048576')
@@ -166,6 +176,14 @@ try {
   await expect(page.getByText('All systems quiet')).toBeVisible({ timeout: 15000 })
   expect(await readFile(join(repo, 'hello.ts'), 'utf8')).toContain('"substrate"')
   await expect(page.locator('.message-assistant')).toContainText('Updated hello.ts and verified the command.')
+  const citation = page.getByRole('link', { name: 'Example source' })
+  await expect(citation).toHaveAttribute('href', 'https://example.com/')
+  await app.evaluate(({ shell }) => {
+    shell.openExternal = async (url) => { globalThis.openedCitation = url }
+  })
+  await citation.click()
+  await expect.poll(() => app.evaluate(() => globalThis.openedCitation)).toBe('https://example.com/')
+  await expect(page.evaluate(() => window.substrate.openLink('file:///etc/passwd'))).rejects.toThrow(/Only HTTP and HTTPS/)
   await expect(page.locator('.code-container .monaco-editor')).toContainText('substrate')
   await page.getByRole('button', { name: 'Back to files' }).click()
   await page.getByRole('button', { name: 'Changes', exact: false }).click()
@@ -205,9 +223,11 @@ try {
   // Renderer has no Node primitives, no raw IPC and no credential retrieval.
   expect(await page.evaluate(() => ({ node: typeof window.require, process: typeof window.process, exposed: Object.keys(window.substrate).sort() }))).toEqual({
     node: 'undefined', process: 'undefined',
-    exposed: ['createProject', 'onEvent', 'openProject', 'platform', 'rpc', 'setApiKey']
+    exposed: ['createProject', 'onEvent', 'openLink', 'openProject', 'platform', 'rpc', 'setApiKey', 'setSearchApiKey']
   })
-  await expect(page.evaluate(() => window.substrate.rpc('config.credentials', { key: 'bad' }))).rejects.toThrow(/Unsupported operation/)
+  for (const method of ['config.credentials', 'config.web_search_credentials']) {
+    await expect(page.evaluate(method => window.substrate.rpc(method, { key: 'bad' }), method)).rejects.toThrow(/Unsupported operation/)
+  }
   await page.getByRole('textbox', { name: 'Message Substrate' }).fill('Apply a code edit automatically')
   await page.getByRole('button', { name: 'Send message' }).click()
   await expect(page.getByText(/^Waiting for your approval/)).toBeVisible()

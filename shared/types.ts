@@ -40,6 +40,7 @@ export interface Change {
 export interface Config {
   model: string;
   has_key: boolean;
+  has_search_key: boolean;
   max_steps: number;
   context_budget_bytes: number;
 }
@@ -62,6 +63,8 @@ export interface DesktopAPI {
   openProject(): Promise<Project | null>;
   createProject(name: string): Promise<Project>;
   setApiKey(key: string): Promise<void>;
+  setSearchApiKey(key: string): Promise<void>;
+  openLink(url: string): Promise<void>;
   onEvent(callback: (event: AgentEvent) => void): () => void;
   platform: string;
 }

@@ -15,6 +15,7 @@ const MAX_MAX_STEPS: u64 = 128;
 
 struct Config {
     key: String,
+    search_key: String,
     model: String,
     max_steps: usize,
     context_budget_bytes: usize,
@@ -41,13 +42,22 @@ impl Server {
             "config.get" => {
                 let c = self.config.lock().await;
                 Ok(
-                    json!({"model":c.model,"has_key":!c.key.is_empty(),"max_steps":c.max_steps,"context_budget_bytes":c.context_budget_bytes}),
+                    json!({"model":c.model,"has_key":!c.key.is_empty(),"has_search_key":!c.search_key.is_empty(),"max_steps":c.max_steps,"context_budget_bytes":c.context_budget_bytes}),
                 )
             }
             "config.credentials" => {
                 let key = str_arg(p, "key")?;
                 ensure!(key.len() < 8192, "Invalid API key");
                 self.config.lock().await.key = key.into();
+                Ok(json!(true))
+            }
+            "config.web_search_credentials" => {
+                let key = str_arg(p, "key")?.trim();
+                ensure!(
+                    key.len() < 8192 && key.bytes().all(|byte| byte.is_ascii_graphic()),
+                    "Invalid Brave Search API key"
+                );
+                self.config.lock().await.search_key = key.into();
                 Ok(json!(true))
             }
             "config.update" => {
@@ -288,6 +298,7 @@ impl Server {
                         )
                     };
                 let config = agent_core::RunConfig {
+                    web: agent_tools::WebTools::new(&c.search_key)?,
                     selection_mode,
                     snippet_packing,
                     subq_review,
@@ -432,6 +443,10 @@ async fn main() -> Result<()> {
         config_path,
         config: Arc::new(Mutex::new(Config {
             key: std::env::var("SUBQ_API_KEY").unwrap_or_default(),
+            search_key: std::env::var("BRAVE_SEARCH_API_KEY")
+                .unwrap_or_default()
+                .trim()
+                .into(),
             model: agent_models::current_model(
                 saved["model"]
                     .as_str()

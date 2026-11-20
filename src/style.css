@@ -938,8 +938,8 @@ select:focus {
   padding: 6px;
   border: 1px solid #e1e5d8;
 }
-.disabled-link {
-  color: #789050;
+.markdown a {
+  color: #567335;
   text-decoration: underline;
 }
 .tool-card {
